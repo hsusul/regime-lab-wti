@@ -17,3 +17,6 @@ runs/*
 *.npz
 *.html
 *.png
+.venv311/
+.venv/
+__pycache__/
