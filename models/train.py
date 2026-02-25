@@ -184,7 +184,8 @@ def train_model_run(
         sigma=params["sigma"],
         transition_matrix=params["transition_matrix"],
     )
-    ordered_labels = [regime_labels.get(str(i), f"regime_{i}") for i in range(n_states)]
+    sorted_state_idx = np.argsort(np.asarray(params["sigma"], dtype=np.float64), kind="stable")
+    ordered_labels = [regime_labels.get(str(int(i)), f"regime_{int(i)}") for i in sorted_state_idx]
 
     filter_probs = forward_filter_probs(
         observations=returns,
