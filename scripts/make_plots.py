@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -67,6 +67,45 @@ def load_predict_payload(run_dir: Path) -> dict:
     return payload
 
 
+def load_labels_mapping(run_dir: Path, n_states: int) -> dict[str, str]:
+    """Load stable regime labels from artifact with sensible fallback."""
+    label_path = run_dir / "regime_labels.json"
+    if label_path.exists():
+        with label_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        if isinstance(payload, dict):
+            mapping_raw: Any
+            if "label_mapping" in payload and isinstance(payload["label_mapping"], dict):
+                mapping_raw = payload["label_mapping"]
+            else:
+                mapping_raw = payload
+
+            mapping: dict[str, str] = {}
+            for i in range(n_states):
+                mapping[str(i)] = str(mapping_raw.get(str(i), f"regime_{i}"))
+            return mapping
+
+    return {str(i): f"regime_{i}" for i in range(n_states)}
+
+
+def load_viterbi_states(run_dir: Path, n_obs: int) -> np.ndarray | None:
+    """Load Viterbi states if available; return None when artifact is absent."""
+    viterbi_path = run_dir / "viterbi_states.json"
+    if not viterbi_path.exists():
+        return None
+
+    with viterbi_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    states = np.asarray(payload.get("states", []), dtype=np.int64)
+    if states.ndim != 1:
+        raise ValueError("viterbi_states.json field 'states' must be 1D.")
+    if states.shape[0] != n_obs:
+        raise ValueError("viterbi_states.json length mismatch with predict_proba observations.")
+    return states
+
+
 def contiguous_segments(states: np.ndarray) -> list[tuple[int, int, int]]:
     """Return contiguous state spans as (start_idx, end_idx, state)."""
     if states.size == 0:
@@ -88,7 +127,11 @@ def contiguous_segments(states: np.ndarray) -> list[tuple[int, int, int]]:
 
 
 def build_figure(
-    dates: Sequence[str], returns: np.ndarray, regime_probabilities: np.ndarray
+    dates: Sequence[str],
+    returns: np.ndarray,
+    regime_probabilities: np.ndarray,
+    labels_mapping: dict[str, str],
+    viterbi_states: np.ndarray | None = None,
 ) -> go.Figure:
     x = pd.to_datetime(dates)
     if x.empty:
@@ -100,7 +143,9 @@ def build_figure(
         raise ValueError("dates and regime_probabilities length mismatch.")
 
     cumulative_index = 100.0 * np.exp(np.cumsum(returns))
-    states = np.argmax(regime_probabilities, axis=1)
+    filter_states = np.argmax(regime_probabilities, axis=1)
+    shading_states = viterbi_states if viterbi_states is not None else filter_states
+    regime_source = "Viterbi" if viterbi_states is not None else "Filtering argmax"
 
     fig = make_subplots(
         rows=2,
@@ -108,10 +153,13 @@ def build_figure(
         shared_xaxes=True,
         row_heights=[0.62, 0.38],
         vertical_spacing=0.08,
-        subplot_titles=("Cumulative Return Index with Regime Shading", "Regime Probabilities"),
+        subplot_titles=(
+            f"Cumulative Return Index with {regime_source} Regime Shading",
+            "Filtering Regime Probabilities",
+        ),
     )
 
-    segments = contiguous_segments(states)
+    segments = contiguous_segments(shading_states)
     for start_idx, end_idx, state in segments:
         x0 = x[start_idx]
         if end_idx + 1 < len(x):
@@ -144,12 +192,13 @@ def build_figure(
 
     n_states = regime_probabilities.shape[1]
     for k in range(n_states):
+        label = labels_mapping.get(str(k), f"regime_{k}")
         fig.add_trace(
             go.Scatter(
                 x=x,
                 y=regime_probabilities[:, k],
                 mode="lines",
-                name=f"Regime {k} Prob",
+                name=f"{label} prob",
                 line={"color": LINE_COLORS[k % len(LINE_COLORS)], "width": 2},
             ),
             row=2,
@@ -186,7 +235,16 @@ def main() -> None:
     if returns.shape[0] != len(dates):
         raise ValueError("dates and returns length mismatch.")
 
-    fig = build_figure(dates=dates, returns=returns, regime_probabilities=regime_probabilities)
+    labels_mapping = load_labels_mapping(run_dir=run_dir, n_states=regime_probabilities.shape[1])
+    viterbi_states = load_viterbi_states(run_dir=run_dir, n_obs=returns.shape[0])
+
+    fig = build_figure(
+        dates=dates,
+        returns=returns,
+        regime_probabilities=regime_probabilities,
+        labels_mapping=labels_mapping,
+        viterbi_states=viterbi_states,
+    )
 
     output_path = Path(args.out) if args.out else run_dir / "regimes.html"
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -18,6 +18,7 @@ from energy_data.eia_client import EIAClientConfig, EIAWTIClient
 from energy_data.features import compute_log_returns, time_based_split
 from models.hmm_tfp import GaussianHMMTFP, HMMTrainingConfig
 from models.infer import (
+    assign_regime_labels,
     build_regime_summary,
     forecast_predictive_distribution,
     forward_filter_probs,
@@ -178,6 +179,13 @@ def train_model_run(
     test_ll = float(model.log_prob(test_obs).numpy())
 
     params = model.get_params()
+    regime_labels = assign_regime_labels(
+        mu=params["mu"],
+        sigma=params["sigma"],
+        transition_matrix=params["transition_matrix"],
+    )
+    ordered_labels = [regime_labels.get(str(i), f"regime_{i}") for i in range(n_states)]
+
     filter_probs = forward_filter_probs(
         observations=returns,
         initial_probs=params["initial_probs"],
@@ -185,8 +193,17 @@ def train_model_run(
         mu=params["mu"],
         sigma=params["sigma"],
     )
+    viterbi_states = model.viterbi(returns)
+    if viterbi_states.shape[0] != returns.shape[0]:
+        raise ValueError("Viterbi decode output length does not match returns length.")
 
     predict_payload = predict_proba_payload(dates=dates, returns=returns, filter_probs=filter_probs)
+    viterbi_payload = {
+        "dates": dates,
+        "states": [int(s) for s in viterbi_states],
+        "labels": [regime_labels.get(str(int(s)), f"regime_{int(s)}") for s in viterbi_states],
+        "label_mapping": regime_labels,
+    }
     regime_summary = build_regime_summary(
         dates=dates,
         returns=returns,
@@ -194,11 +211,13 @@ def train_model_run(
         transition_matrix=params["transition_matrix"],
         mu=params["mu"],
         sigma=params["sigma"],
+        regime_labels=regime_labels,
     )
 
     transition_payload = {
         "transition_matrix": params["transition_matrix"].tolist(),
-        "state_labels": [f"regime_{i}" for i in range(n_states)],
+        "state_labels": ordered_labels,
+        "label_mapping": regime_labels,
     }
 
     default_forecast = forecast_predictive_distribution(
@@ -250,8 +269,10 @@ def train_model_run(
     model.save(run_path / "model_params.npz")
     _write_json(run_path / "metrics.json", metrics_payload)
     _write_json(run_path / "transition_matrix.json", transition_payload)
+    _write_json(run_path / "regime_labels.json", {"label_mapping": regime_labels})
     _write_json(run_path / "regime_summary.json", regime_summary)
     _write_json(run_path / "predict_proba.json", predict_payload)
+    _write_json(run_path / "viterbi_states.json", viterbi_payload)
     _write_json(run_path / "forecast_default.json", default_forecast)
 
     (run_root / "latest_run.txt").write_text(run_id_final, encoding="utf-8")

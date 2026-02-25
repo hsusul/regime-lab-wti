@@ -43,6 +43,36 @@ def fit_model(request: FitRequest) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/runs")
+def list_runs() -> dict[str, Any]:
+    """List available run directories under runs/ sorted newest-first."""
+    if not RUNS_ROOT.exists():
+        return {"runs": []}
+
+    run_ids = sorted(
+        [p.name for p in RUNS_ROOT.iterdir() if p.is_dir() and p.name.startswith("run_")],
+        reverse=True,
+    )
+    return {"runs": run_ids}
+
+
+@router.get("/runs/{run_id}/summary")
+def run_summary(run_id: str) -> dict[str, Any]:
+    """Return regime summary for a specific run id."""
+    run_path = _resolve_run_path(run_id)
+    return _read_json(run_path / "regime_summary.json")
+
+
+@router.get("/runs/{run_id}/plot")
+def run_plot_path(run_id: str) -> dict[str, str]:
+    """Return filesystem path to plot artifact for a specific run id."""
+    run_path = _resolve_run_path(run_id)
+    plot_path = run_path / "regimes.html"
+    if not plot_path.exists():
+        raise HTTPException(status_code=404, detail=f"Artifact not found: {plot_path.name}")
+    return {"run_id": run_id, "plot_path": str(plot_path)}
+
+
 @router.get("/predict_proba")
 def predict_proba(run_id: Optional[str] = Query(default=None)) -> dict[str, Any]:
     """Return dates, observed returns, and per-regime filtering probabilities."""

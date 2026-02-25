@@ -9,6 +9,40 @@ import numpy as np
 import pandas as pd
 
 
+def assign_regime_labels(
+    mu: np.ndarray, sigma: np.ndarray, transition_matrix: np.ndarray
+) -> dict[str, str]:
+    """Assign deterministic semantic labels to regimes.
+
+    Labels are assigned by ascending volatility (sigma):
+    smallest -> low_vol, middle -> mid_vol, largest -> shock.
+    """
+    _ = np.asarray(mu, dtype=np.float64)
+    sigma_arr = np.asarray(sigma, dtype=np.float64)
+    trans = np.asarray(transition_matrix, dtype=np.float64)
+
+    if sigma_arr.ndim != 1:
+        raise ValueError("sigma must be a 1D array")
+    n_states = sigma_arr.shape[0]
+    if trans.shape != (n_states, n_states):
+        raise ValueError("transition_matrix shape mismatch for labels")
+
+    sorted_idx = np.argsort(sigma_arr, kind="stable")
+
+    rank_names = ["low_vol", "mid_vol", "shock"]
+    rank_to_name: list[str] = []
+    for rank in range(n_states):
+        if rank < len(rank_names):
+            rank_to_name.append(rank_names[rank])
+        else:
+            rank_to_name.append(f"regime_rank_{rank}")
+
+    mapping: dict[str, str] = {}
+    for rank, state_idx in enumerate(sorted_idx):
+        mapping[str(int(state_idx))] = rank_to_name[rank]
+    return mapping
+
+
 def _normal_pdf(x: float, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
     sigma = np.maximum(sigma, 1e-8)
     coeff = 1.0 / (sigma * np.sqrt(2.0 * np.pi))
@@ -89,6 +123,7 @@ def build_regime_summary(
     transition_matrix: np.ndarray,
     mu: np.ndarray,
     sigma: np.ndarray,
+    regime_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build per-regime and global summary metrics."""
     returns = np.asarray(returns, dtype=np.float64)
@@ -113,6 +148,11 @@ def build_regime_summary(
         regime_rows.append(
             {
                 "regime": int(k),
+                "label": (
+                    regime_labels.get(str(k), f"regime_{k}")
+                    if regime_labels is not None
+                    else f"regime_{k}"
+                ),
                 "mu": float(mu[k]),
                 "sigma": float(sigma[k]),
                 "avg_posterior_probability": float(np.mean(probs[:, k])),

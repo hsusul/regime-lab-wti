@@ -209,6 +209,63 @@ class GaussianHMMTFP:
         posterior = hmm.posterior_marginals(obs)
         return posterior.probs_parameter().numpy()
 
+    def viterbi(self, observations: np.ndarray) -> np.ndarray:
+        """Compute most likely hidden state sequence for observations."""
+        obs = np.asarray(observations, dtype=np.float64)
+        if obs.ndim != 1 or obs.size == 0:
+            raise ValueError("observations must be a non-empty 1D array")
+
+        try:
+            hmm = self.distribution(obs.shape[0])
+            posterior_mode = hmm.posterior_mode(obs)
+            mode_arr = np.asarray(
+                posterior_mode.numpy() if hasattr(posterior_mode, "numpy") else posterior_mode,
+                dtype=np.int64,
+            )
+            return mode_arr.reshape(-1)
+        except Exception:
+            return self._viterbi_numpy(obs)
+
+    def _viterbi_numpy(self, observations: np.ndarray) -> np.ndarray:
+        """Numpy fallback Viterbi decoder from current model parameters."""
+        params = self.get_params()
+
+        init = np.asarray(params["initial_probs"], dtype=np.float64)
+        trans = np.asarray(params["transition_matrix"], dtype=np.float64)
+        mu = np.asarray(params["mu"], dtype=np.float64)
+        sigma = np.maximum(np.asarray(params["sigma"], dtype=np.float64), 1e-8)
+
+        n_steps = observations.shape[0]
+        n_states = init.shape[0]
+        if trans.shape != (n_states, n_states):
+            raise ValueError("transition matrix shape mismatch")
+
+        eps = 1e-12
+        log_init = np.log(np.clip(init, eps, 1.0))
+        log_trans = np.log(np.clip(trans, eps, 1.0))
+
+        log_norm = -0.5 * np.log(2.0 * np.pi)
+        delta = np.full((n_steps, n_states), -np.inf, dtype=np.float64)
+        psi = np.zeros((n_steps, n_states), dtype=np.int64)
+
+        log_emit0 = log_norm - np.log(sigma) - 0.5 * np.square((observations[0] - mu) / sigma)
+        delta[0] = log_init + log_emit0
+
+        for t in range(1, n_steps):
+            log_emit_t = (
+                log_norm - np.log(sigma) - 0.5 * np.square((observations[t] - mu) / sigma)
+            )
+            scores = delta[t - 1][:, None] + log_trans
+            psi[t] = np.argmax(scores, axis=0)
+            delta[t] = scores[psi[t], np.arange(n_states)] + log_emit_t
+
+        states = np.zeros(n_steps, dtype=np.int64)
+        states[-1] = int(np.argmax(delta[-1]))
+        for t in range(n_steps - 2, -1, -1):
+            states[t] = psi[t + 1, states[t + 1]]
+
+        return states
+
     def _snapshot(self) -> Dict[str, np.ndarray]:
         return {
             "initial_logits": self.initial_logits.numpy().copy(),

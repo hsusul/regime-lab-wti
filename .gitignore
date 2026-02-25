@@ -24,3 +24,11 @@ __pycache__/
 # Local envs
 .venv/
 .venv311/
+.venv/
+.venv311/
+__pycache__/
+*.pyc
+runs/
+.env
+.env.*
+.DS_Store
