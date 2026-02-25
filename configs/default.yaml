@@ -1,0 +1,23 @@
+run_dir: runs
+
+data:
+  raw_dir: data/raw
+  cache_filename: wti_cushing_daily.csv
+  start_date: "2010-01-01"
+  end_date: null
+
+split:
+  train_frac: 0.70
+  val_frac: 0.15
+
+model:
+  n_states: 3
+  learning_rate: 0.05
+  max_epochs: 300
+  patience: 30
+  min_delta: 0.0001
+  seed: 42
+
+forecast:
+  default_horizon: 10
+  interval: 0.95

@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+.pytest_cache/
+.mypy_cache/
+.venv/
+.env
+.DS_Store
+
+# Data and run artifacts
+data/raw/*.csv
+runs/*
+!runs/.gitkeep
+
+# Local artifacts
+*.npz
+*.html
+*.png
