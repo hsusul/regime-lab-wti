@@ -32,3 +32,12 @@ runs/
 .env
 .env.*
 .DS_Store
+
+.venv/
+.venv311/
+runs/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
