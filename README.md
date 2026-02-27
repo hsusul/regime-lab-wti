@@ -40,6 +40,7 @@ wti-regime-monitor/
 ├── scripts/
 │   ├── run_api.py
 │   ├── make_plots.py
+│   ├── print_latest.py
 │   └── train_local.py
 ├── tests/
 │   ├── test_data_fetcher.py
@@ -110,10 +111,52 @@ By default, the HTML is saved to `runs/<run_id>/regimes.html`.
 ## API endpoints
 
 - `POST /fit` -> train a model run, return `run_id`
+- `GET /health` -> health check
+- `GET /runs` -> list run ids (newest first)
+- `GET /runs/latest/summary` -> latest run summary
 - `GET /predict_proba` -> dates, returns, per-regime probabilities
 - `GET /transition_matrix` -> learned transition matrix
 - `GET /regime_summary` -> regime stats, durations, transition counts
 - `GET /forecast` -> multi-step predictive mean + uncertainty interval
+- `POST /predict_current` -> latest/current regime label and state
+
+## How to use the API
+
+1. Start the server:
+
+```bash
+python scripts/run_api.py --host 0.0.0.0 --port 8000
+```
+
+2. Check health:
+
+```bash
+curl "http://127.0.0.1:8000/health"
+```
+
+3. List runs and inspect the latest summary:
+
+```bash
+curl "http://127.0.0.1:8000/runs"
+curl "http://127.0.0.1:8000/runs/latest/summary"
+```
+
+4. Get current regime:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/predict_current" -H 'Content-Type: application/json' -d '{}'
+```
+
+## Demo workflow
+
+```bash
+make test
+make train
+make plot
+make ui
+```
+
+Open [http://localhost:8000/ui](http://localhost:8000/ui).
 
 ### Example `curl` calls
 

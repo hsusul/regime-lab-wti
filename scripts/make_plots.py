@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -50,6 +51,14 @@ def resolve_run_id(runs_root: Path, run_id: str | None) -> str:
     if not latest:
         raise ValueError("runs/latest_run.txt is empty.")
     return latest
+
+
+def ensure_run_artifacts(run_dir: Path, run_id: str, filenames: Sequence[str]) -> None:
+    missing = [name for name in filenames if not (run_dir / name).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Run {run_id} is missing required artifact(s): {', '.join(missing)}"
+        )
 
 
 def load_predict_payload(run_dir: Path) -> dict:
@@ -106,6 +115,20 @@ def load_viterbi_states(run_dir: Path, n_obs: int) -> np.ndarray | None:
     return states
 
 
+def load_regime_summary(run_dir: Path) -> dict[str, Any]:
+    summary_path = run_dir / "regime_summary.json"
+    with summary_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_manifest(run_dir: Path) -> dict[str, Any] | None:
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    with manifest_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def contiguous_segments(states: np.ndarray) -> list[tuple[int, int, int]]:
     """Return contiguous state spans as (start_idx, end_idx, state)."""
     if states.size == 0:
@@ -127,6 +150,9 @@ def contiguous_segments(states: np.ndarray) -> list[tuple[int, int, int]]:
 
 
 def build_figure(
+    run_id: str,
+    date_range: str,
+    as_of_date: str,
     dates: Sequence[str],
     returns: np.ndarray,
     regime_probabilities: np.ndarray,
@@ -154,7 +180,7 @@ def build_figure(
         row_heights=[0.62, 0.38],
         vertical_spacing=0.08,
         subplot_titles=(
-            f"Cumulative Return Index with {regime_source} Regime Shading",
+            f"{run_id} | {date_range} | as_of {as_of_date} | Cumulative Return Index with {regime_source} Regime Shading",
             "Filtering Regime Probabilities",
         ),
     )
@@ -217,6 +243,33 @@ def build_figure(
     return fig
 
 
+def build_plot_meta(
+    run_id: str,
+    summary: dict[str, Any],
+    manifest: dict[str, Any] | None,
+    labels_mapping: dict[str, str],
+    last_state: int,
+    last_date: str,
+    n_obs: int,
+) -> dict[str, Any]:
+    labels = [labels_mapping.get(str(i), f"regime_{i}") for i in sorted(map(int, labels_mapping))]
+    created_at = (
+        str(manifest.get("created_at_utc"))
+        if isinstance(manifest, dict) and manifest.get("created_at_utc")
+        else datetime.now(timezone.utc).isoformat()
+    )
+    return {
+        "run_id": run_id,
+        "created_at_utc": created_at,
+        "start_date": summary.get("start_date"),
+        "end_date": summary.get("end_date"),
+        "n_observations": int(summary.get("n_observations", n_obs)),
+        "labels": labels,
+        "last_label": labels_mapping.get(str(last_state), f"regime_{last_state}"),
+        "last_date": last_date,
+    }
+
+
 def main() -> None:
     args = parse_args()
     runs_root = Path("runs")
@@ -225,7 +278,20 @@ def main() -> None:
     if not run_dir.exists():
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
+    ensure_run_artifacts(
+        run_dir=run_dir,
+        run_id=run_id,
+        filenames=[
+            "predict_proba.json",
+            "viterbi_states.json",
+            "regime_labels.json",
+            "regime_summary.json",
+        ],
+    )
+
     payload = load_predict_payload(run_dir)
+    summary = load_regime_summary(run_dir)
+    manifest = load_manifest(run_dir)
     dates = payload["dates"]
     returns = np.asarray(payload["returns"], dtype=np.float64)
     regime_probabilities = np.asarray(payload["regime_probabilities"], dtype=np.float64)
@@ -237,8 +303,22 @@ def main() -> None:
 
     labels_mapping = load_labels_mapping(run_dir=run_dir, n_states=regime_probabilities.shape[1])
     viterbi_states = load_viterbi_states(run_dir=run_dir, n_obs=returns.shape[0])
+    start_date = summary.get("start_date") if isinstance(summary, dict) else None
+    end_date = summary.get("end_date") if isinstance(summary, dict) else None
+    if start_date and end_date:
+        date_range = f"{start_date} to {end_date}"
+    else:
+        date_range = f"{dates[0]} to {dates[-1]}"
+    if viterbi_states is not None:
+        last_state = int(viterbi_states[-1])
+    else:
+        last_state = int(np.argmax(regime_probabilities[-1]))
+    as_of_date = str(dates[-1])
 
     fig = build_figure(
+        run_id=run_id,
+        date_range=date_range,
+        as_of_date=as_of_date,
         dates=dates,
         returns=returns,
         regime_probabilities=regime_probabilities,
@@ -249,6 +329,17 @@ def main() -> None:
     output_path = Path(args.out) if args.out else run_dir / "regimes.html"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(str(output_path), include_plotlyjs="cdn", full_html=True)
+    plot_meta = build_plot_meta(
+        run_id=run_id,
+        summary=summary,
+        manifest=manifest,
+        labels_mapping=labels_mapping,
+        last_state=last_state,
+        last_date=as_of_date,
+        n_obs=int(returns.shape[0]),
+    )
+    with (run_dir / "plot_meta.json").open("w", encoding="utf-8") as f:
+        json.dump(plot_meta, f, indent=2)
     print(output_path)
 
 

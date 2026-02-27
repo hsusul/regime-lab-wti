@@ -19,8 +19,8 @@ class HMMTrainingConfig:
 
     learning_rate: float = 0.05
     max_epochs: int = 300
-    patience: int = 30
-    min_delta: float = 1e-4
+    patience: int = 10
+    min_delta: float = 1e-3
     occupancy_entropy_weight: float = 1.0
 
 
@@ -117,6 +117,7 @@ class GaussianHMMTFP:
         best_metric = -np.inf
         best_weights = self._snapshot()
         stale_epochs = 0
+        stopped_early = False
 
         train_tensor = tf.convert_to_tensor(train_obs, dtype=self.dtype)
         val_tensor = (
@@ -164,12 +165,14 @@ class GaussianHMMTFP:
                 stale_epochs += 1
 
             if stale_epochs >= cfg.patience:
+                stopped_early = True
                 break
 
         self._restore(best_weights)
 
         history["best_val_log_likelihood"] = best_metric
         history["epochs_ran"] = len(history["train_log_likelihood"])
+        history["stopped_early"] = stopped_early
         return history
 
     def get_params(self) -> Dict[str, np.ndarray]:

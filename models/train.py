@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import random
+import subprocess
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +13,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 import yaml
 
@@ -53,8 +56,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "n_states": 3,
         "learning_rate": 0.05,
         "max_epochs": 300,
-        "patience": 30,
-        "min_delta": 1e-4,
+        "patience": 10,
+        "min_delta": 1e-3,
         "seed": 42,
     },
     "forecast": {
@@ -101,6 +104,43 @@ def set_global_seed(seed: int) -> None:
 def _make_run_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"run_{ts}_{uuid4().hex[:8]}"
+
+
+def _safe_git_commit_hash(repo_root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            return None
+        commit = completed.stdout.strip()
+        return commit if commit else None
+    except Exception:
+        return None
+
+
+def _config_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _log_return_short_series_message(price_df: pd.DataFrame) -> str:
+    prices = pd.to_numeric(price_df.get("price"), errors="coerce")
+    original_count = int(price_df.shape[0])
+    filtered_count = int((prices > 0).sum())
+    dropped_non_positive_or_nan = original_count - filtered_count
+    min_price = float(prices.min()) if prices.notna().any() else None
+    return (
+        "Insufficient positive price history after filtering for log returns. "
+        f"original_count={original_count}, "
+        f"filtered_count={filtered_count}, "
+        f"min_price={min_price}, "
+        f"dropped_non_positive_or_nan={dropped_non_positive_or_nan}"
+    )
 
 
 def resolve_run_dir(run_id: Optional[str], runs_root: str | Path = "runs") -> Path:
@@ -151,7 +191,12 @@ def train_model_run(
         start_date=cfg.data.get("start_date"),
         end_date=cfg.data.get("end_date"),
     )
-    features = compute_log_returns(prices)
+    try:
+        features = compute_log_returns(prices)
+    except ValueError as exc:
+        if "Need at least 10 positive price observations" in str(exc):
+            raise ValueError(_log_return_short_series_message(prices)) from exc
+        raise
 
     dates = [d.strftime("%Y-%m-%d") for d in features["date"]]
     returns = features["log_return"].to_numpy(dtype=np.float64)
@@ -237,6 +282,8 @@ def train_model_run(
     run_path = run_root / run_id_final
     run_path.mkdir(parents=True, exist_ok=True)
 
+    run_created_at = datetime.now(timezone.utc).isoformat()
+
     metrics_payload = {
         "train_log_likelihood": train_ll,
         "val_log_likelihood": val_ll,
@@ -250,7 +297,7 @@ def train_model_run(
             "val": int(val_obs.size),
             "test": int(test_obs.size),
         },
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "created_at_utc": run_created_at,
     }
 
     config_payload = {
@@ -266,6 +313,32 @@ def train_model_run(
         },
     }
 
+    artifact_filenames = [
+        "config.json",
+        "model_params.npz",
+        "metrics.json",
+        "transition_matrix.json",
+        "regime_labels.json",
+        "regime_summary.json",
+        "predict_proba.json",
+        "viterbi_states.json",
+        "forecast_default.json",
+        "manifest.json",
+    ]
+
+    manifest_payload = {
+        "run_id": run_id_final,
+        "created_at_utc": run_created_at,
+        "config_hash": _config_hash(config_payload["loaded_config"]),
+        "git_commit_hash": _safe_git_commit_hash(Path(__file__).resolve().parents[1]),
+        "n_states": int(n_states),
+        "seed": int(seed),
+        "start_date": dates[0] if dates else None,
+        "end_date": dates[-1] if dates else None,
+        "n_observations": int(returns.shape[0]),
+        "artifacts": artifact_filenames,
+    }
+
     _write_json(run_path / "config.json", config_payload)
     model.save(run_path / "model_params.npz")
     _write_json(run_path / "metrics.json", metrics_payload)
@@ -275,6 +348,7 @@ def train_model_run(
     _write_json(run_path / "predict_proba.json", predict_payload)
     _write_json(run_path / "viterbi_states.json", viterbi_payload)
     _write_json(run_path / "forecast_default.json", default_forecast)
+    _write_json(run_path / "manifest.json", manifest_payload)
 
     (run_root / "latest_run.txt").write_text(run_id_final, encoding="utf-8")
 

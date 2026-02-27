@@ -34,8 +34,8 @@ def compute_log_returns(
 
     # EIA occasionally includes missing/placeholder values; drop non-positive prices.
     df = df[df[price_col] > 0].copy()
-    if df.shape[0] < 2:
-        raise ValueError("Need at least 2 positive price observations to compute log returns.")
+    if df.shape[0] < 10:
+        raise ValueError("Need at least 10 positive price observations to compute log returns.")
 
     df["log_return"] = np.log(df[price_col]).diff()
     df = df.dropna(subset=["log_return"]).reset_index(drop=True)

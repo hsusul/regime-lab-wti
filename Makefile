@@ -1,7 +1,7 @@
 PYTHON ?= python
 VENV ?= .venv
 
-.PHONY: install test train api
+.PHONY: install test train plot api ui
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -12,7 +12,13 @@ test:
 	pytest -q
 
 train:
-	$(PYTHON) scripts/train_local.py --config configs/default.yaml
+	$(PYTHON) -m scripts.train_local --config configs/default.yaml
+
+plot:
+	$(PYTHON) -m scripts.make_plots
 
 api:
-	$(PYTHON) scripts/run_api.py --host 0.0.0.0 --port 8000
+	uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+ui:
+	uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

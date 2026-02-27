@@ -27,7 +27,15 @@ def assign_regime_labels(
     if trans.shape != (n_states, n_states):
         raise ValueError("transition_matrix shape mismatch for labels")
 
-    sorted_idx = np.argsort(sigma_arr, kind="stable")
+    mu_arr = np.asarray(mu, dtype=np.float64)
+    if mu_arr.shape != sigma_arr.shape:
+        raise ValueError("mu/sigma shape mismatch for labels")
+
+    # Primary: sigma ascending.
+    # Tie-breaker: abs(mu) ascending so higher |mu| receives the "shock" rank for tied sigma.
+    # Final tie-breaker: state index ascending for deterministic output.
+    state_idx = np.arange(n_states, dtype=np.int64)
+    sorted_idx = np.lexsort((state_idx, np.abs(mu_arr), sigma_arr))
 
     rank_names = ["low_vol", "mid_vol", "shock"]
     rank_to_name: list[str] = []
