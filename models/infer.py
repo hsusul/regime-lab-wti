@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from statistics import NormalDist
 from typing import Any, Sequence
 
@@ -49,6 +51,121 @@ def assign_regime_labels(
     for rank, state_idx in enumerate(sorted_idx):
         mapping[str(int(state_idx))] = rank_to_name[rank]
     return mapping
+
+
+def stationary_distribution(
+    transition_matrix: np.ndarray, tol: float = 1e-10, max_iter: int = 10_000
+) -> np.ndarray:
+    """Compute stationary distribution via power iteration."""
+    a_mat = np.asarray(transition_matrix, dtype=np.float64)
+    if a_mat.ndim != 2 or a_mat.shape[0] != a_mat.shape[1]:
+        raise ValueError("transition_matrix must be square")
+
+    n_states = a_mat.shape[0]
+    dist = np.full(n_states, 1.0 / n_states, dtype=np.float64)
+
+    for _ in range(max_iter):
+        nxt = dist @ a_mat
+        if np.max(np.abs(nxt - dist)) < tol:
+            dist = nxt
+            break
+        dist = nxt
+
+    total = float(np.sum(dist))
+    if total <= 0:
+        return np.full(n_states, 1.0 / n_states, dtype=np.float64)
+    return dist / total
+
+
+def one_step_predictive_regime_distribution(
+    current_probs: np.ndarray, transition_matrix: np.ndarray
+) -> np.ndarray:
+    """Propagate current state probabilities forward one step."""
+    probs = np.asarray(current_probs, dtype=np.float64)
+    a_mat = np.asarray(transition_matrix, dtype=np.float64)
+    if probs.ndim != 1:
+        raise ValueError("current_probs must be 1D")
+    if a_mat.shape != (probs.shape[0], probs.shape[0]):
+        raise ValueError("transition_matrix shape mismatch for one-step prediction")
+
+    nxt = probs @ a_mat
+    total = float(np.sum(nxt))
+    if total <= 0:
+        return np.full_like(probs, 1.0 / probs.shape[0], dtype=np.float64)
+    return nxt / total
+
+
+def probability_weighted_moments(
+    state_probs: np.ndarray, mu: np.ndarray, sigma: np.ndarray
+) -> tuple[float, float]:
+    """Compute mixture expected return and volatility from state probabilities."""
+    probs = np.asarray(state_probs, dtype=np.float64)
+    mu_arr = np.asarray(mu, dtype=np.float64)
+    sigma_arr = np.asarray(sigma, dtype=np.float64)
+
+    if probs.ndim != 1:
+        raise ValueError("state_probs must be 1D")
+    if mu_arr.shape != probs.shape or sigma_arr.shape != probs.shape:
+        raise ValueError("mu/sigma shape mismatch for weighted moments")
+
+    mean = float(np.dot(probs, mu_arr))
+    second_moment = float(np.dot(probs, np.square(sigma_arr) + np.square(mu_arr)))
+    variance = max(second_moment - mean * mean, 1e-12)
+    return mean, float(np.sqrt(variance))
+
+
+def load_model_params_json(path: Path) -> dict[str, np.ndarray]:
+    """Load compact model parameters needed for artifact-first inference."""
+    if not path.exists():
+        raise FileNotFoundError(f"Artifact not found: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    required = {"transition_matrix", "mu", "sigma"}
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(f"model_params.json missing fields: {sorted(missing)}")
+
+    transition_matrix = np.asarray(payload["transition_matrix"], dtype=np.float64)
+    mu = np.asarray(payload["mu"], dtype=np.float64)
+    sigma = np.asarray(payload["sigma"], dtype=np.float64)
+
+    if mu.ndim != 1 or sigma.ndim != 1:
+        raise ValueError("mu and sigma must be 1D arrays")
+    if mu.shape != sigma.shape:
+        raise ValueError("mu and sigma must have matching shapes")
+    n_states = mu.shape[0]
+    if transition_matrix.shape != (n_states, n_states):
+        raise ValueError("transition_matrix shape mismatch with mu/sigma")
+
+    initial_probs_raw = payload.get("initial_probs")
+    initial_logits_raw = payload.get("initial_logits")
+    if initial_probs_raw is not None:
+        initial_probs = np.asarray(initial_probs_raw, dtype=np.float64)
+        if initial_probs.shape != (n_states,):
+            raise ValueError("initial_probs shape mismatch")
+        total = float(np.sum(initial_probs))
+        if total <= 0:
+            raise ValueError("initial_probs must sum to a positive value")
+        initial_probs = initial_probs / total
+    elif initial_logits_raw is not None:
+        logits = np.asarray(initial_logits_raw, dtype=np.float64)
+        if logits.shape != (n_states,):
+            raise ValueError("initial_logits shape mismatch")
+        shifted = logits - np.max(logits)
+        exp_logits = np.exp(shifted)
+        initial_probs = exp_logits / np.sum(exp_logits)
+    else:
+        initial_probs = stationary_distribution(transition_matrix)
+
+    return {
+        "n_states": np.asarray([n_states], dtype=np.int64),
+        "transition_matrix": transition_matrix,
+        "mu": mu,
+        "sigma": sigma,
+        "initial_probs": initial_probs,
+    }
 
 
 def _normal_pdf(x: float, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:

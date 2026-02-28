@@ -224,6 +224,16 @@ def train_model_run(
     test_ll = float(model.log_prob(test_obs).numpy())
 
     params = model.get_params()
+    model_params_payload = {
+        "n_states": int(n_states),
+        "initial_probs": [float(x) for x in params["initial_probs"]],
+        "initial_logits": [float(x) for x in params["initial_logits"]],
+        "transition_matrix": [
+            [float(x) for x in row] for row in params["transition_matrix"]
+        ],
+        "mu": [float(x) for x in params["mu"]],
+        "sigma": [float(x) for x in params["sigma"]],
+    }
     regime_labels = assign_regime_labels(
         mu=params["mu"],
         sigma=params["sigma"],
@@ -316,6 +326,7 @@ def train_model_run(
     artifact_filenames = [
         "config.json",
         "model_params.npz",
+        "model_params.json",
         "metrics.json",
         "transition_matrix.json",
         "regime_labels.json",
@@ -341,6 +352,7 @@ def train_model_run(
 
     _write_json(run_path / "config.json", config_payload)
     model.save(run_path / "model_params.npz")
+    _write_json(run_path / "model_params.json", model_params_payload)
     _write_json(run_path / "metrics.json", metrics_payload)
     _write_json(run_path / "transition_matrix.json", transition_payload)
     _write_json(run_path / "regime_labels.json", {"label_mapping": regime_labels})

@@ -12,13 +12,13 @@ test:
 	pytest -q
 
 train:
-	$(PYTHON) -m scripts.train_local --config configs/default.yaml
+	$(PYTHON) -m scripts.train_local --config configs/default.yaml --force-refresh
 
 plot:
 	$(PYTHON) -m scripts.make_plots
 
 api:
-	uvicorn app.main:app --host 0.0.0.0 --port 8000
+	uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 ui:
 	uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

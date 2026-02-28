@@ -12,7 +12,11 @@ from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from models.infer import forecast_predictive_distribution
+from models.infer import (
+    forecast_predictive_distribution,
+    load_model_params_json,
+    probability_weighted_moments,
+)
 from models.train import resolve_run_dir, train_model_run
 
 router = APIRouter()
@@ -55,6 +59,14 @@ def fit_model(request: FitRequest) -> dict[str, Any]:
 def list_runs() -> dict[str, Any]:
     """List available run directories under runs/ sorted newest-first."""
     return {"runs": _list_run_ids()}
+
+
+@router.get("/runs/latest")
+def latest_run() -> dict[str, Any]:
+    """Return lightweight metadata for the newest run."""
+    run_id = _latest_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return _latest_run_payload(run_id, run_path)
 
 
 @router.get("/runs/latest/summary")
@@ -117,6 +129,13 @@ def run_manifest(run_id: str) -> dict[str, Any]:
     """Return manifest payload for a run."""
     run_path = _resolve_run_path(run_id)
     return _read_json(run_path / "manifest.json", run_id=run_id)
+
+
+@router.get("/runs/{run_id}/model")
+def run_model(run_id: str) -> dict[str, Any]:
+    """Return compact model parameters for a run."""
+    run_path = _resolve_run_path(run_id)
+    return _read_json(run_path / "model_params.json", run_id=run_id)
 
 
 @router.get("/ui")
@@ -278,14 +297,24 @@ def _predict_current_impl(
     labels_map = _read_label_mapping(run_path)
     viterbi_path = run_path / "viterbi_states.json"
     proba_path = run_path / "predict_proba.json"
-    probs_mapping = _load_last_label_probs_or_none(
-        run_id=run_id,
-        proba_path=proba_path,
-        labels_map=labels_map,
-        include_probs=include_probs,
-    )
+    model_params = _load_model_params_or_none(run_id=run_id, run_path=run_path)
 
-    if viterbi_path.exists():
+    viterbi_exists = viterbi_path.exists()
+    should_load_probs = include_probs or not viterbi_exists
+    prob_info = (
+        _load_last_prob_info(run_id=run_id, proba_path=proba_path, labels_map=labels_map)
+        if should_load_probs
+        else None
+    )
+    n_states_hint: int | None = None
+    if model_params is not None and "transition_matrix" in model_params:
+        n_states_hint = int(np.asarray(model_params["transition_matrix"]).shape[0])
+    elif prob_info is not None:
+        n_states_hint = int(len(prob_info["raw_state_probs"]))
+    if n_states_hint is not None:
+        labels_map = _with_default_labels(labels_map, n_states_hint)
+
+    if viterbi_exists:
         viterbi = _read_json(viterbi_path, run_id=run_id)
         dates = viterbi.get("dates", [])
         states = viterbi.get("states", [])
@@ -295,51 +324,72 @@ def _predict_current_impl(
                 status_code=400,
                 detail=f"Run {run_id} has empty artifact: viterbi_states.json",
             )
+        if not labels_map:
+            labels_map = _with_default_labels(labels_map, int(max(states)) + 1)
         state = int(states[-1])
         label = (
             str(labels[-1])
             if len(labels) == len(states)
             else labels_map.get(str(state), f"regime_{state}")
         )
-        payload = {
+        expected_return = None
+        expected_vol = None
+        if prob_info is not None and model_params is not None:
+            expected_return, expected_vol = probability_weighted_moments(
+                state_probs=np.asarray(prob_info["raw_state_probs"], dtype=np.float64),
+                mu=model_params["mu"],
+                sigma=model_params["sigma"],
+            )
+
+        payload: dict[str, Any] = {
             "run_id": run_id,
             "as_of_date": str(dates[-1]),
+            "as_of": str(dates[-1]),
             "state": state,
             "label": label,
             "p_label": None,
             "source": "viterbi",
+            "label_mapping": labels_map,
+            "expected_return": expected_return,
+            "expected_vol": expected_vol,
         }
+        if prob_info is not None and state < len(prob_info["raw_state_probs"]):
+            payload["p_label"] = float(prob_info["raw_state_probs"][state])
         if include_probs:
-            payload["probs"] = probs_mapping
+            payload["probs"] = (
+                prob_info["label_probs"] if prob_info is not None else None
+            )
+            payload["raw_state_probs"] = (
+                prob_info["raw_state_probs"] if prob_info is not None else None
+            )
         return payload
 
-    if proba_path.exists():
-        probs = _read_json(proba_path, run_id=run_id)
-        dates = probs.get("dates", [])
-        regime_probabilities = np.asarray(probs.get("regime_probabilities", []), dtype=np.float64)
-        if not dates or regime_probabilities.size == 0:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Run {run_id} has empty artifact: predict_proba.json",
+    if prob_info is not None:
+        state = int(prob_info["state"])
+        expected_return = None
+        expected_vol = None
+        if model_params is not None:
+            expected_return, expected_vol = probability_weighted_moments(
+                state_probs=np.asarray(prob_info["raw_state_probs"], dtype=np.float64),
+                mu=model_params["mu"],
+                sigma=model_params["sigma"],
             )
-        if regime_probabilities.ndim != 2:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Run {run_id} has malformed artifact: predict_proba.json",
-            )
-        last_probs = regime_probabilities[-1]
-        state = int(np.argmax(last_probs))
-        p_label = float(last_probs[state])
+
         payload = {
             "run_id": run_id,
-            "as_of_date": str(dates[-1]),
+            "as_of_date": str(prob_info["as_of_date"]),
+            "as_of": str(prob_info["as_of_date"]),
             "state": state,
             "label": labels_map.get(str(state), f"regime_{state}"),
-            "p_label": p_label,
+            "p_label": float(prob_info["p_label"]),
             "source": "filtering_argmax",
+            "label_mapping": labels_map,
+            "expected_return": expected_return,
+            "expected_vol": expected_vol,
         }
         if include_probs:
-            payload["probs"] = probs_mapping
+            payload["probs"] = prob_info["label_probs"]
+            payload["raw_state_probs"] = prob_info["raw_state_probs"]
         return payload
 
     raise _artifact_not_found(run_id, ["viterbi_states.json", "predict_proba.json"])
@@ -376,7 +426,7 @@ def forecast(
     """Return horizon-step predictive mean and uncertainty intervals."""
     run_path = _resolve_run_path(run_id)
 
-    model_params = np.load(run_path / "model_params.npz")
+    model_params = _load_forecast_model_params(run_path=run_path)
     probs_payload = _read_json(run_path / "predict_proba.json", run_id=run_path.name)
 
     regime_probs = np.asarray(probs_payload["regime_probabilities"], dtype=np.float64)
@@ -386,9 +436,9 @@ def forecast(
 
     payload = forecast_predictive_distribution(
         last_posterior=regime_probs[-1],
-        transition_matrix=model_params["transition_matrix"],
-        mu=model_params["mu"],
-        sigma=model_params["sigma"],
+        transition_matrix=np.asarray(model_params["transition_matrix"], dtype=np.float64),
+        mu=np.asarray(model_params["mu"], dtype=np.float64),
+        sigma=np.asarray(model_params["sigma"], dtype=np.float64),
         horizon=horizon,
         interval=interval,
         last_date=dates[-1],
@@ -420,6 +470,53 @@ def _latest_run_id_or_404() -> str:
     return run_ids[0]
 
 
+def _latest_run_payload(run_id: str, run_path: Path) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "run_dir": str(run_path),
+        "created_at_utc": None,
+        "end_date": None,
+        "last_label": None,
+        "last_date": None,
+    }
+
+    manifest_path = run_path / "manifest.json"
+    if manifest_path.exists():
+        manifest = _read_json(manifest_path, run_id=run_id)
+        payload["created_at_utc"] = manifest.get("created_at_utc")
+        payload["end_date"] = manifest.get("end_date")
+
+    plot_meta_path = run_path / "plot_meta.json"
+    if plot_meta_path.exists():
+        plot_meta = _read_json(plot_meta_path, run_id=run_id)
+        payload["created_at_utc"] = payload["created_at_utc"] or plot_meta.get("created_at_utc")
+        payload["end_date"] = payload["end_date"] or plot_meta.get("end_date")
+        payload["last_label"] = plot_meta.get("last_label")
+        payload["last_date"] = plot_meta.get("last_date")
+
+    if payload["last_label"] is None or payload["last_date"] is None:
+        viterbi_path = run_path / "viterbi_states.json"
+        if viterbi_path.exists():
+            viterbi = _read_json(viterbi_path, run_id=run_id)
+            dates = viterbi.get("dates", [])
+            states = viterbi.get("states", [])
+            labels = viterbi.get("labels", [])
+            if dates and states:
+                payload["last_date"] = payload["last_date"] or str(dates[-1])
+                state = int(states[-1])
+                if len(labels) == len(states):
+                    payload["last_label"] = payload["last_label"] or str(labels[-1])
+                else:
+                    labels_map = _read_label_mapping(run_path)
+                    payload["last_label"] = payload["last_label"] or labels_map.get(
+                        str(state), f"regime_{state}"
+                    )
+
+    if payload["end_date"] is None:
+        payload["end_date"] = payload["last_date"]
+    return payload
+
+
 def _read_label_mapping(run_path: Path) -> dict[str, str]:
     label_path = run_path / "regime_labels.json"
     if label_path.exists():
@@ -438,19 +535,65 @@ def _artifact_not_found(run_id: str, artifact_names: list[str]) -> HTTPException
     )
 
 
-def _load_last_label_probs_or_none(
+def _with_default_labels(labels_map: dict[str, str], n_states: int) -> dict[str, str]:
+    out = {str(k): str(v) for k, v in labels_map.items()}
+    for idx in range(n_states):
+        out.setdefault(str(idx), f"regime_{idx}")
+    return out
+
+
+def _load_forecast_model_params(run_path: Path) -> dict[str, np.ndarray]:
+    model_json_path = run_path / "model_params.json"
+    if model_json_path.exists():
+        try:
+            return load_model_params_json(model_json_path)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Run {run_path.name} has malformed artifact: model_params.json ({exc})",
+            ) from exc
+
+    npz_path = run_path / "model_params.npz"
+    if npz_path.exists():
+        npz = np.load(npz_path)
+        return {
+            "transition_matrix": np.asarray(npz["transition_matrix"], dtype=np.float64),
+            "mu": np.asarray(npz["mu"], dtype=np.float64),
+            "sigma": np.asarray(npz["sigma"], dtype=np.float64),
+        }
+
+    raise _artifact_not_found(run_path.name, ["model_params.json", "model_params.npz"])
+
+
+def _load_model_params_or_none(run_id: str, run_path: Path) -> dict[str, np.ndarray] | None:
+    model_json_path = run_path / "model_params.json"
+    if not model_json_path.exists():
+        return None
+    try:
+        return load_model_params_json(model_json_path)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has malformed artifact: model_params.json ({exc})",
+        ) from exc
+
+
+def _load_last_prob_info(
     run_id: str,
     proba_path: Path,
     labels_map: dict[str, str],
-    include_probs: bool,
-) -> dict[str, float] | None:
-    if not include_probs:
-        return None
+) -> dict[str, Any] | None:
     if not proba_path.exists():
         return None
     probs = _read_json(proba_path, run_id=run_id)
+    dates = probs.get("dates", [])
     regime_probabilities = np.asarray(probs.get("regime_probabilities", []), dtype=np.float64)
-    if regime_probabilities.ndim != 2 or regime_probabilities.shape[0] == 0:
+    if not dates or regime_probabilities.size == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has empty artifact: predict_proba.json",
+        )
+    if regime_probabilities.ndim != 2 or regime_probabilities.shape[0] != len(dates):
         raise HTTPException(
             status_code=400,
             detail=f"Run {run_id} has malformed artifact: predict_proba.json",
@@ -460,7 +603,14 @@ def _load_last_label_probs_or_none(
     for idx, prob in enumerate(last_probs):
         label = labels_map.get(str(idx), f"regime_{idx}")
         out[label] = float(prob)
-    return out
+    state = int(np.argmax(last_probs))
+    return {
+        "as_of_date": str(dates[-1]),
+        "state": state,
+        "p_label": float(last_probs[state]),
+        "raw_state_probs": [float(x) for x in last_probs],
+        "label_probs": out,
+    }
 
 
 def _read_json(path: Path, run_id: str | None = None) -> dict[str, Any]:
