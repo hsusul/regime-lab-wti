@@ -17,6 +17,7 @@ from models.infer import (
     load_model_params_json,
     probability_weighted_moments,
 )
+from models.provenance import write_manifest_with_provenance
 from models.train import resolve_run_dir, train_model_run
 
 router = APIRouter()
@@ -130,12 +131,24 @@ def latest_run_evaluation() -> dict[str, Any]:
     return _read_json(run_path / "evaluation.json", run_id=run_id)
 
 
+@router.get("/runs/latest/scorecard")
+def latest_run_scorecard() -> dict[str, Any]:
+    """Return compact scorecard for latest run."""
+    run_id = _latest_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return _build_scorecard_payload(run_id=run_id, run_path=run_path)
+
+
 @router.get("/runs/latest/events")
-def latest_run_events() -> dict[str, Any]:
+def latest_run_events(
+    label: Optional[str] = Query(default=None),
+    min_duration_days: Optional[int] = Query(default=None, ge=1),
+) -> dict[str, Any]:
     """Return regime events for latest run."""
     run_id = _latest_run_id_or_404()
     run_path = _resolve_run_path(run_id)
-    return _load_or_build_events(run_path=run_path)
+    payload = _load_or_build_events(run_path=run_path)
+    return _filter_events_payload(payload, label=label, min_duration_days=min_duration_days)
 
 
 @router.get("/runs/latest/plot")
@@ -163,11 +176,23 @@ def run_evaluation(run_id: str) -> dict[str, Any]:
     return _read_json(run_path / "evaluation.json", run_id=run_id)
 
 
+@router.get("/runs/{run_id}/scorecard")
+def run_scorecard(run_id: str) -> dict[str, Any]:
+    """Return compact scorecard for a run."""
+    run_path = _resolve_run_path(run_id)
+    return _build_scorecard_payload(run_id=run_id, run_path=run_path)
+
+
 @router.get("/runs/{run_id}/events")
-def run_events(run_id: str) -> dict[str, Any]:
+def run_events(
+    run_id: str,
+    label: Optional[str] = Query(default=None),
+    min_duration_days: Optional[int] = Query(default=None, ge=1),
+) -> dict[str, Any]:
     """Return regime events artifact for a run."""
     run_path = _resolve_run_path(run_id)
-    return _load_or_build_events(run_path=run_path)
+    payload = _load_or_build_events(run_path=run_path)
+    return _filter_events_payload(payload, label=label, min_duration_days=min_duration_days)
 
 
 @router.get("/runs/{run_id}/plot")
@@ -197,6 +222,19 @@ def run_artifacts(run_id: str) -> dict[str, Any]:
     run_path = _resolve_run_path(run_id)
     artifacts = sorted([p.name for p in run_path.iterdir() if p.is_file()])
     return {"run_id": run_id, "artifacts": artifacts}
+
+
+@router.get("/runs/{run_id}/artifacts/{name}")
+def download_run_artifact(run_id: str, name: str) -> Response:
+    """Download a run artifact as raw bytes with content-type."""
+    run_path = _resolve_run_path(run_id)
+    artifact_path = run_path / name
+    if not artifact_path.exists() or not artifact_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Run {run_id} missing artifact: {name}",
+        )
+    return Response(content=artifact_path.read_bytes(), media_type=_artifact_media_type(name))
 
 
 @router.get("/runs/{run_id}/manifest")
@@ -315,6 +353,12 @@ def ui_page() -> HTMLResponse:
     <strong>Run summary</strong>
     <pre id="summaryPre">N/A</pre>
   </div>
+  <div class="box">
+    <strong>Compare pinned vs latest</strong>
+    <div id="compareStatus">N/A</div>
+    <button id="compareBtn" type="button" style="display:none; margin-top:8px;">Compare pinned vs latest</button>
+    <pre id="comparePre" style="margin-top:8px; white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;"></pre>
+  </div>
   <iframe id="plotFrame" src="about:blank" title="Regime Plot"></iframe>
 
   <script>
@@ -329,6 +373,11 @@ def ui_page() -> HTMLResponse:
     const currentMetaEl = document.getElementById("currentMeta");
     const summaryPre = document.getElementById("summaryPre");
     const plotFrame = document.getElementById("plotFrame");
+    const compareBtn = document.getElementById("compareBtn");
+    const compareStatus = document.getElementById("compareStatus");
+    const comparePre = document.getElementById("comparePre");
+    let pinnedRunId = null;
+    let latestRunId = null;
 
     async function fetchJson(url, options) {{
       const res = await fetch(url, options || {{}});
@@ -352,11 +401,25 @@ def ui_page() -> HTMLResponse:
     async function loadPinned() {{
       try {{
         const pinned = await fetchJson("/runs/pinned");
+        pinnedRunId = pinned.run_id;
         pinnedInfoEl.innerHTML = "<strong>Pinned run:</strong> " + pinned.run_id;
         unpinBtn.style.display = "inline-block";
       }} catch (err) {{
+        pinnedRunId = null;
         pinnedInfoEl.innerHTML = "<strong>Pinned run:</strong> none";
         unpinBtn.style.display = "none";
+      }}
+      updateCompareControls();
+    }}
+
+    function updateCompareControls() {{
+      const shouldShow = Boolean(pinnedRunId && latestRunId && pinnedRunId !== latestRunId);
+      compareBtn.style.display = shouldShow ? "inline-block" : "none";
+      compareStatus.textContent = shouldShow
+        ? ("Ready: pinned=" + pinnedRunId + ", latest=" + latestRunId)
+        : "N/A";
+      if (!shouldShow) {{
+        comparePre.textContent = "";
       }}
     }}
 
@@ -404,6 +467,7 @@ def ui_page() -> HTMLResponse:
       try {{
         const payload = await fetchJson("/runs");
         const runs = Array.isArray(payload.runs) ? payload.runs : [];
+        latestRunId = runs.length > 0 ? runs[0] : null;
         await loadActive();
         await loadPinned();
         runSelect.innerHTML = "";
@@ -457,6 +521,30 @@ def ui_page() -> HTMLResponse:
         statusEl.textContent = resp.unpinned ? "Unpinned active run" : "No pinned run to remove";
       }} catch (err) {{
         statusEl.textContent = "Error unpinning run: " + err.message;
+      }}
+    }});
+    compareBtn.addEventListener("click", async () => {{
+      if (!pinnedRunId || !latestRunId || pinnedRunId === latestRunId) {{
+        return;
+      }}
+      try {{
+        const payload = await fetchJson("/runs/compare", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ run_ids: [pinnedRunId, latestRunId] }})
+        }});
+        const diffs = payload.diffs || {{}};
+        const runs = Array.isArray(payload.runs) ? payload.runs : [];
+        const first = runs[0] || {{}};
+        const second = runs[1] || {{}};
+        comparePre.textContent =
+          "pinned best_val_ll: " + (first.metrics ? first.metrics.best_val_ll : "N/A") + "\\n" +
+          "latest best_val_ll: " + (second.metrics ? second.metrics.best_val_ll : "N/A") + "\\n" +
+          "delta_best_val_ll: " + (diffs.delta_best_val_ll ?? "N/A") + "\\n" +
+          "delta_transition_entropy: " + (diffs.delta_transition_entropy ?? "N/A") + "\\n" +
+          "delta_shock_occupancy: " + (diffs.delta_shock_occupancy ?? "N/A");
+      }} catch (err) {{
+        comparePre.textContent = "Error comparing runs: " + err.message;
       }}
     }});
     refreshBtn.addEventListener("click", refreshRuns);
@@ -846,6 +934,16 @@ def _artifact_not_found(run_id: str, artifact_names: list[str]) -> HTTPException
     )
 
 
+def _artifact_media_type(name: str) -> str:
+    if name.endswith(".json"):
+        return "application/json"
+    if name.endswith(".html"):
+        return "text/html; charset=utf-8"
+    if name.endswith(".npz"):
+        return "application/octet-stream"
+    return "application/octet-stream"
+
+
 def _with_default_labels(labels_map: dict[str, str], n_states: int) -> dict[str, str]:
     out = {str(k): str(v) for k, v in labels_map.items()}
     for idx in range(n_states):
@@ -937,7 +1035,9 @@ def _load_or_build_events(run_path: Path) -> dict[str, Any]:
     run_id = run_path.name
     events_path = run_path / "events.json"
     if events_path.exists():
-        return _read_json(events_path, run_id=run_id)
+        existing = _read_json(events_path, run_id=run_id)
+        if _events_payload_is_enriched(existing):
+            return existing
 
     missing: list[str] = []
     viterbi_path = run_path / "viterbi_states.json"
@@ -970,8 +1070,7 @@ def _load_or_build_events(run_path: Path) -> dict[str, Any]:
         if isinstance(artifacts, list) and "events.json" not in artifacts:
             artifacts.append("events.json")
             manifest["artifacts"] = artifacts
-            with manifest_path.open("w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2)
+        write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest)
 
     return events_payload
 
@@ -1000,38 +1099,64 @@ def _build_events_payload(
         )
 
     seq_states = [int(s) for s in states]
-    seq_returns = [float(r) for r in returns]
+    seq_returns = np.asarray([float(r) for r in returns], dtype=np.float64)
     segments: list[dict[str, Any]] = []
     start_idx = 0
     current_state = seq_states[0]
+    segment_index = 0
 
     for idx in range(1, len(seq_states)):
         if seq_states[idx] != current_state:
             end_idx = idx - 1
-            cumulative_log_return = float(np.sum(seq_returns[start_idx : end_idx + 1]))
+            segment_returns = seq_returns[start_idx : end_idx + 1]
+            cumulative_log_return = float(np.sum(segment_returns))
+            length = int(end_idx - start_idx + 1)
             segments.append(
                 {
+                    "segment_index": int(segment_index),
                     "state": int(current_state),
                     "label": labels_map.get(str(current_state), f"regime_{current_state}"),
+                    "start_idx": int(start_idx),
+                    "end_idx": int(end_idx),
                     "start_date": str(dates[start_idx]),
                     "end_date": str(dates[end_idx]),
-                    "length": int(end_idx - start_idx + 1),
+                    "length": length,
+                    "duration_days": length,
                     "cumulative_log_return": cumulative_log_return,
+                    "mean_return": float(np.mean(segment_returns)),
+                    "realized_vol": (
+                        float(np.std(segment_returns, ddof=1))
+                        if segment_returns.shape[0] > 1
+                        else 0.0
+                    ),
                 }
             )
+            segment_index += 1
             start_idx = idx
             current_state = seq_states[idx]
 
     end_idx = len(seq_states) - 1
-    cumulative_log_return = float(np.sum(seq_returns[start_idx : end_idx + 1]))
+    segment_returns = seq_returns[start_idx : end_idx + 1]
+    cumulative_log_return = float(np.sum(segment_returns))
+    length = int(end_idx - start_idx + 1)
     segments.append(
         {
+            "segment_index": int(segment_index),
             "state": int(current_state),
             "label": labels_map.get(str(current_state), f"regime_{current_state}"),
+            "start_idx": int(start_idx),
+            "end_idx": int(end_idx),
             "start_date": str(dates[start_idx]),
             "end_date": str(dates[end_idx]),
-            "length": int(end_idx - start_idx + 1),
+            "length": length,
+            "duration_days": length,
             "cumulative_log_return": cumulative_log_return,
+            "mean_return": float(np.mean(segment_returns)),
+            "realized_vol": (
+                float(np.std(segment_returns, ddof=1))
+                if segment_returns.shape[0] > 1
+                else 0.0
+            ),
         }
     )
 
@@ -1039,6 +1164,121 @@ def _build_events_payload(
         "run_id": run_id,
         "n_events": int(len(segments)),
         "events": segments,
+    }
+
+
+def _events_payload_is_enriched(payload: dict[str, Any]) -> bool:
+    events = payload.get("events", [])
+    if not isinstance(events, list):
+        return False
+    if not events:
+        return True
+    required = {
+        "segment_index",
+        "start_idx",
+        "end_idx",
+        "duration_days",
+        "mean_return",
+        "realized_vol",
+    }
+    first = events[0]
+    if not isinstance(first, dict):
+        return False
+    return required.issubset(set(first.keys()))
+
+
+def _filter_events_payload(
+    payload: dict[str, Any],
+    label: str | None,
+    min_duration_days: int | None,
+) -> dict[str, Any]:
+    events = payload.get("events", [])
+    if not isinstance(events, list):
+        events = []
+
+    filtered = events
+    if label is not None:
+        filtered = [event for event in filtered if str(event.get("label")) == label]
+    if min_duration_days is not None:
+        filtered = [
+            event
+            for event in filtered
+            if int(event.get("duration_days", event.get("length", 0))) >= min_duration_days
+        ]
+
+    out = dict(payload)
+    out["events"] = filtered
+    out["n_events"] = int(len(filtered))
+    return out
+
+
+def _build_scorecard_payload(run_id: str, run_path: Path) -> dict[str, Any]:
+    evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
+    events_payload = _load_or_build_events(run_path=run_path)
+    viterbi = _read_json(run_path / "viterbi_states.json", run_id=run_id)
+
+    eval_metrics = evaluation.get("metrics", {})
+    best_val_ll = _as_float_or_none(eval_metrics.get("best_val_log_likelihood"))
+    epochs_ran = eval_metrics.get("epochs_ran")
+    stopped_early = eval_metrics.get("stopped_early")
+
+    if epochs_ran is None or stopped_early is None:
+        metrics_path = run_path / "metrics.json"
+        if metrics_path.exists():
+            metrics_payload = _read_json(metrics_path, run_id=run_id)
+            history = metrics_payload.get("history", {})
+            if epochs_ran is None:
+                epochs_ran = history.get("epochs_ran")
+            if stopped_early is None:
+                stopped_early = history.get("stopped_early")
+
+    transition_entropy = _as_float_or_none(
+        evaluation.get("regime_diagnostics", {}).get("transition_entropy")
+    )
+    shock_occupancy = _shock_occupancy(evaluation.get("regime_diagnostics", {}))
+    if shock_occupancy is None:
+        summary_path = run_path / "regime_summary.json"
+        if summary_path.exists():
+            shock_occupancy = _shock_occupancy(_read_json(summary_path, run_id=run_id))
+
+    events = events_payload.get("events", [])
+    events_by_label: dict[str, int] = {}
+    if isinstance(events, list):
+        for event in events:
+            label = str(event.get("label", "unknown"))
+            events_by_label[label] = events_by_label.get(label, 0) + 1
+
+    dates = viterbi.get("dates", [])
+    states = viterbi.get("states", [])
+    labels = viterbi.get("labels", [])
+    if not dates or not states:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has empty artifact: viterbi_states.json",
+        )
+    last_state = int(states[-1])
+    if len(labels) == len(states):
+        last_label = str(labels[-1])
+    else:
+        last_label = _read_label_mapping(run_path).get(str(last_state), f"regime_{last_state}")
+
+    return {
+        "run_id": run_id,
+        "metrics": {
+            "best_val_log_likelihood": best_val_ll,
+            "epochs_ran": int(epochs_ran) if epochs_ran is not None else None,
+            "stopped_early": bool(stopped_early) if stopped_early is not None else None,
+        },
+        "diagnostics": {
+            "transition_entropy": transition_entropy,
+            "shock_occupancy": shock_occupancy,
+        },
+        "events_by_label": events_by_label,
+        "last_regime": {
+            "state": last_state,
+            "label": last_label,
+            "date": str(dates[-1]),
+        },
     }
 
 

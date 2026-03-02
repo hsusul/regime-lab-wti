@@ -27,6 +27,7 @@ from models.infer import (
     forward_filter_probs,
     predict_proba_payload,
 )
+from models.provenance import write_manifest_with_provenance
 
 
 @dataclass
@@ -192,33 +193,59 @@ def _build_events_payload(
     events: list[dict[str, Any]] = []
     start_idx = 0
     current = int(seq_states[0])
+    segment_index = 0
 
     for idx in range(1, seq_states.shape[0]):
         state_i = int(seq_states[idx])
         if state_i != current:
             end_idx = idx - 1
+            segment_returns = seq_returns[start_idx : end_idx + 1]
+            length = int(end_idx - start_idx + 1)
             events.append(
                 {
+                    "segment_index": int(segment_index),
                     "state": int(current),
                     "label": labels_map.get(str(current), f"regime_{current}"),
+                    "start_idx": int(start_idx),
+                    "end_idx": int(end_idx),
                     "start_date": str(dates[start_idx]),
                     "end_date": str(dates[end_idx]),
-                    "length": int(end_idx - start_idx + 1),
-                    "cumulative_log_return": float(np.sum(seq_returns[start_idx : end_idx + 1])),
+                    "length": length,
+                    "duration_days": length,
+                    "cumulative_log_return": float(np.sum(segment_returns)),
+                    "mean_return": float(np.mean(segment_returns)),
+                    "realized_vol": (
+                        float(np.std(segment_returns, ddof=1))
+                        if segment_returns.shape[0] > 1
+                        else 0.0
+                    ),
                 }
             )
+            segment_index += 1
             start_idx = idx
             current = state_i
 
     end_idx = seq_states.shape[0] - 1
+    segment_returns = seq_returns[start_idx : end_idx + 1]
+    length = int(end_idx - start_idx + 1)
     events.append(
         {
+            "segment_index": int(segment_index),
             "state": int(current),
             "label": labels_map.get(str(current), f"regime_{current}"),
+            "start_idx": int(start_idx),
+            "end_idx": int(end_idx),
             "start_date": str(dates[start_idx]),
             "end_date": str(dates[end_idx]),
-            "length": int(end_idx - start_idx + 1),
-            "cumulative_log_return": float(np.sum(seq_returns[start_idx : end_idx + 1])),
+            "length": length,
+            "duration_days": length,
+            "cumulative_log_return": float(np.sum(segment_returns)),
+            "mean_return": float(np.mean(segment_returns)),
+            "realized_vol": (
+                float(np.std(segment_returns, ddof=1))
+                if segment_returns.shape[0] > 1
+                else 0.0
+            ),
         }
     )
     return {"run_id": run_id, "n_events": int(len(events)), "events": events}
@@ -425,6 +452,8 @@ def train_model_run(
         "metrics": {
             "best_val_log_likelihood": float(history.get("best_val_log_likelihood", val_ll)),
             "test_avg_log_likelihood": float(test_ll / float(test_obs.size)),
+            "epochs_ran": int(history.get("epochs_ran", len(history.get("train_log_likelihood", [])))),
+            "stopped_early": bool(history.get("stopped_early", False)),
         },
         "regime_diagnostics": {
             "implied_avg_duration_days": [
@@ -490,7 +519,7 @@ def train_model_run(
     _write_json(run_path / "viterbi_states.json", viterbi_payload)
     _write_json(run_path / "events.json", events_payload)
     _write_json(run_path / "forecast_default.json", default_forecast)
-    _write_json(run_path / "manifest.json", manifest_payload)
+    write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest_payload)
 
     (run_root / "latest_run.txt").write_text(run_id_final, encoding="utf-8")
 

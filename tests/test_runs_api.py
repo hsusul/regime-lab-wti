@@ -349,6 +349,7 @@ def test_ui_page_loads(monkeypatch, tmp_path: Path) -> None:
     assert "Pin this run" in response.text
     assert "Active run" in response.text
     assert "Unpin" in response.text
+    assert "Compare pinned vs latest" in response.text
 
 
 def test_run_artifacts_endpoint(monkeypatch, tmp_path: Path) -> None:
@@ -368,6 +369,33 @@ def test_run_artifacts_endpoint(monkeypatch, tmp_path: Path) -> None:
     payload = response.json()
     assert payload["run_id"] == run_id
     assert payload["artifacts"] == ["a.json", "b.txt"]
+
+
+def test_download_artifact_endpoint(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260110T000000Z_download"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "payload.json").write_text('{"x":1}', encoding="utf-8")
+    (run_dir / "page.html").write_text("<html>ok</html>", encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    json_resp = client.get(f"/runs/{run_id}/artifacts/payload.json")
+    assert json_resp.status_code == 200
+    assert json_resp.headers["content-type"].startswith("application/json")
+    assert json_resp.content == b'{"x":1}'
+
+    html_resp = client.get(f"/runs/{run_id}/artifacts/page.html")
+    assert html_resp.status_code == 200
+    assert html_resp.headers["content-type"].startswith("text/html")
+    assert html_resp.content == b"<html>ok</html>"
+
+    missing_resp = client.get(f"/runs/{run_id}/artifacts/missing.json")
+    assert missing_resp.status_code == 404
+    assert run_id in missing_resp.json()["detail"]
+    assert "missing.json" in missing_resp.json()["detail"]
 
 
 def test_predict_current_include_probs(monkeypatch, tmp_path: Path) -> None:
@@ -569,9 +597,174 @@ def test_events_endpoints(monkeypatch, tmp_path: Path) -> None:
     assert payload["n_events"] == 2
     assert payload["events"][0]["label"] == "low_vol"
     assert payload["events"][1]["label"] == "shock"
+    assert payload["events"][0]["segment_index"] == 0
+    assert payload["events"][0]["start_idx"] == 0
+    assert payload["events"][0]["end_idx"] == 1
+    assert payload["events"][0]["duration_days"] == 2
+    assert "mean_return" in payload["events"][0]
+    assert "realized_vol" in payload["events"][0]
     assert payload["events"][0]["length"] == 2
     assert (run_dir / "events.json").exists()
 
     latest = client.get("/runs/latest/events")
+    assert latest.status_code == 200
+    assert latest.json()["run_id"] == run_id
+
+    filtered_label = client.get(f"/runs/{run_id}/events?label=shock")
+    assert filtered_label.status_code == 200
+    assert filtered_label.json()["n_events"] == 1
+    assert filtered_label.json()["events"][0]["label"] == "shock"
+
+    filtered_duration = client.get(f"/runs/{run_id}/events?min_duration_days=3")
+    assert filtered_duration.status_code == 200
+    assert filtered_duration.json()["n_events"] == 0
+
+
+def test_events_enrichment_for_legacy_payload(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260121T000000Z_events_legacy"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    (run_dir / "events.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "n_events": 1,
+                "events": [
+                    {
+                        "state": 0,
+                        "label": "low_vol",
+                        "start_date": "2026-01-20",
+                        "end_date": "2026-01-21",
+                        "length": 2,
+                        "cumulative_log_return": -0.01,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "regime_labels.json").write_text(
+        json.dumps({"label_mapping": {"0": "low_vol", "1": "mid_vol", "2": "shock"}}),
+        encoding="utf-8",
+    )
+    (run_dir / "viterbi_states.json").write_text(
+        json.dumps({"dates": ["2026-01-20", "2026-01-21"], "states": [0, 0]}),
+        encoding="utf-8",
+    )
+    (run_dir / "predict_proba.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-01-20", "2026-01-21"],
+                "returns": [0.01, -0.02],
+                "regime_probabilities": [[0.9, 0.05, 0.05], [0.9, 0.05, 0.05]],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    response = client.get(f"/runs/{run_id}/events")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["n_events"] == 1
+    assert "segment_index" in payload["events"][0]
+    assert "duration_days" in payload["events"][0]
+    assert "mean_return" in payload["events"][0]
+
+
+def test_scorecard_endpoints(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260122T000000Z_score"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "evaluation.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "best_val_log_likelihood": 12.3,
+                    "epochs_ran": 42,
+                    "stopped_early": True,
+                },
+                "regime_diagnostics": {
+                    "transition_entropy": 0.77,
+                    "regimes": [
+                        {"label": "low_vol", "avg_posterior_probability": 0.7},
+                        {"label": "mid_vol", "avg_posterior_probability": 0.2},
+                        {"label": "shock", "avg_posterior_probability": 0.1},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "events.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "n_events": 3,
+                "events": [
+                    {
+                        "segment_index": 0,
+                        "label": "low_vol",
+                        "start_idx": 0,
+                        "end_idx": 0,
+                        "duration_days": 1,
+                        "mean_return": 0.0,
+                        "realized_vol": 0.0,
+                    },
+                    {
+                        "segment_index": 1,
+                        "label": "shock",
+                        "start_idx": 1,
+                        "end_idx": 1,
+                        "duration_days": 1,
+                        "mean_return": 0.0,
+                        "realized_vol": 0.0,
+                    },
+                    {
+                        "segment_index": 2,
+                        "label": "shock",
+                        "start_idx": 2,
+                        "end_idx": 2,
+                        "duration_days": 1,
+                        "mean_return": 0.0,
+                        "realized_vol": 0.0,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "viterbi_states.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-01-20", "2026-01-21"],
+                "states": [0, 2],
+                "labels": ["low_vol", "shock"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    by_id = client.get(f"/runs/{run_id}/scorecard")
+    assert by_id.status_code == 200
+    payload = by_id.json()
+    assert payload["run_id"] == run_id
+    assert isinstance(payload["metrics"]["best_val_log_likelihood"], float)
+    assert isinstance(payload["metrics"]["epochs_ran"], int)
+    assert isinstance(payload["metrics"]["stopped_early"], bool)
+    assert isinstance(payload["diagnostics"]["transition_entropy"], float)
+    assert isinstance(payload["diagnostics"]["shock_occupancy"], float)
+    assert payload["events_by_label"]["shock"] == 2
+    assert payload["last_regime"]["label"] == "shock"
+
+    latest = client.get("/runs/latest/scorecard")
     assert latest.status_code == 200
     assert latest.json()["run_id"] == run_id

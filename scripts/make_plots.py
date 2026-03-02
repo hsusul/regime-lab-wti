@@ -13,6 +13,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from models.provenance import write_manifest_with_provenance
 
 REGIME_COLORS = [
     "rgba(31, 119, 180, 0.18)",
@@ -340,6 +341,17 @@ def main() -> None:
     )
     with (run_dir / "plot_meta.json").open("w", encoding="utf-8") as f:
         json.dump(plot_meta, f, indent=2)
+
+    if isinstance(manifest, dict):
+        artifacts = manifest.get("artifacts", [])
+        if not isinstance(artifacts, list):
+            artifacts = []
+            manifest["artifacts"] = artifacts
+        for name in ("regimes.html", "plot_meta.json"):
+            if name not in artifacts:
+                artifacts.append(name)
+        write_manifest_with_provenance(run_dir=run_dir, manifest_payload=manifest)
+
     print(output_path)
 
 

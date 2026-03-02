@@ -114,6 +114,8 @@ By default, the HTML is saved to `runs/<run_id>/regimes.html`.
 - `GET /health` -> health check
 - `GET /runs` -> list run ids (newest first)
 - `GET /runs/latest/summary` -> latest run summary
+- `GET /runs/{run_id}/artifacts/{name}` -> download raw artifact bytes
+- `GET /runs/{run_id}/scorecard` -> compact run quality/diagnostics summary
 - `GET /predict_proba` -> dates, returns, per-regime probabilities
 - `GET /transition_matrix` -> learned transition matrix
 - `GET /regime_summary` -> regime stats, durations, transition counts
