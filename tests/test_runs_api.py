@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import time
 import zipfile
 from pathlib import Path
 
@@ -360,6 +362,14 @@ def test_ui_page_loads(monkeypatch, tmp_path: Path) -> None:
     assert "Active run" in response.text
     assert "Unpin" in response.text
     assert "Compare pinned vs latest" in response.text
+    assert "Download bundle.zip" in response.text
+    assert "View report.md" in response.text
+    assert "Tags" in response.text
+    assert "Run Notes" in response.text
+    assert "Save notes.md" in response.text
+    assert "Trash" in response.text
+    assert "Purge trash entry" in response.text
+    assert "Frozen:" in response.text
 
 
 def test_run_artifacts_endpoint(monkeypatch, tmp_path: Path) -> None:
@@ -937,13 +947,15 @@ def test_bundle_zip_endpoint(monkeypatch, tmp_path: Path) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "a.json").write_text('{"a":1}', encoding="utf-8")
     (run_dir / "b.html").write_text("<html>b</html>", encoding="utf-8")
+    hash_a = hashlib.sha256((run_dir / "a.json").read_bytes()).hexdigest()
+    hash_b = hashlib.sha256((run_dir / "b.html").read_bytes()).hexdigest()
     (run_dir / "manifest.json").write_text(
         json.dumps(
             {
                 "run_id": run_id,
                 "schema_version": 1,
                 "artifacts": ["a.json", "b.html", "manifest.json"],
-                "artifacts_sha256": {},
+                "artifacts_sha256": {"a.json": hash_a, "b.html": hash_b},
             }
         ),
         encoding="utf-8",
@@ -1065,3 +1077,684 @@ def test_compare_pinned_latest_and_transition_alerts(monkeypatch, tmp_path: Path
     assert alert_payload["run_id"] == run_b.name
     assert alert_payload["count"] == 1
     assert alert_payload["last_transition"]["from_label"] == "low_vol"
+
+
+def test_version_endpoint_and_additive_fields(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260303T000000Z_version"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
+    (run_dir / "evaluation.json").write_text(
+        json.dumps(
+            {
+                "metrics": {"best_val_log_likelihood": 1.0, "epochs_ran": 2, "stopped_early": False},
+                "regime_diagnostics": {
+                    "transition_entropy": 0.5,
+                    "regimes": [
+                        {"label": "low_vol", "avg_posterior_probability": 0.6},
+                        {"label": "mid_vol", "avg_posterior_probability": 0.3},
+                        {"label": "shock", "avg_posterior_probability": 0.1},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "events.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "n_events": 1,
+                "events": [
+                    {
+                        "segment_index": 0,
+                        "state": 0,
+                        "label": "low_vol",
+                        "start_idx": 0,
+                        "end_idx": 0,
+                        "start_date": "2026-03-03",
+                        "end_date": "2026-03-03",
+                        "length": 1,
+                        "duration_days": 1,
+                        "cumulative_log_return": 0.0,
+                        "mean_return": 0.0,
+                        "realized_vol": 0.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "viterbi_states.json").write_text(
+        json.dumps({"dates": ["2026-03-03"], "states": [0], "labels": ["low_vol"]}),
+        encoding="utf-8",
+    )
+    (run_dir / "regime_labels.json").write_text(
+        json.dumps({"label_mapping": {"0": "low_vol", "1": "mid_vol", "2": "shock"}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    version = client.get("/version")
+    assert version.status_code == 200
+    version_payload = version.json()
+    assert "api_version" in version_payload
+    assert "schema_version" in version_payload
+    assert "built_at_utc" in version_payload
+
+    latest = client.get("/runs/latest")
+    assert latest.status_code == 200
+    assert "api_version" in latest.json()
+    assert "schema_version" in latest.json()
+
+    scorecard = client.get(f"/runs/{run_id}/scorecard")
+    assert scorecard.status_code == 200
+    assert "api_version" in scorecard.json()
+    assert "schema_version" in scorecard.json()
+
+    current = client.post("/predict_current", json={"run_id": run_id})
+    assert current.status_code == 200
+    assert "api_version" in current.json()
+    assert "schema_version" in current.json()
+
+
+def test_delete_and_restore_run_lifecycle(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_a = runs_root / "run_20260301T000000Z_a"
+    run_b = runs_root / "run_20260302T000000Z_b"
+    run_a.mkdir(parents=True, exist_ok=True)
+    run_b.mkdir(parents=True, exist_ok=True)
+    (runs_root / "latest_run.txt").write_text(run_b.name, encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    delete_resp = client.delete(f"/runs/{run_b.name}")
+    assert delete_resp.status_code == 200
+    trash_id = delete_resp.json()["trash_id"]
+    assert not run_b.exists()
+    assert (runs_root / "_trash" / trash_id).exists()
+    assert (runs_root / "latest_run.txt").read_text(encoding="utf-8").strip() == run_a.name
+
+    restore_resp = client.post(f"/runs/trash/{trash_id}/restore")
+    assert restore_resp.status_code == 200
+    assert (runs_root / run_b.name).exists()
+
+
+def test_delete_rejects_pinned_or_frozen(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    pinned = runs_root / "run_20260301T000000Z_pinned"
+    frozen = runs_root / "run_20260302T000000Z_frozen"
+    pinned.mkdir(parents=True, exist_ok=True)
+    frozen.mkdir(parents=True, exist_ok=True)
+    (runs_root / "pinned_run.txt").write_text(pinned.name, encoding="utf-8")
+    (frozen / "frozen.json").write_text(json.dumps({"frozen": True}), encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    pinned_resp = client.delete(f"/runs/{pinned.name}")
+    assert pinned_resp.status_code == 409
+    frozen_resp = client.delete(f"/runs/{frozen.name}")
+    assert frozen_resp.status_code == 409
+
+
+def test_json_read_cache_invalidation(tmp_path: Path) -> None:
+    tmp_root = tmp_path / "cache"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    path = tmp_root / "manifest.json"
+    path.write_text(json.dumps({"value": 1}), encoding="utf-8")
+    first = routes._read_json(path, run_id="run_cache")
+    first["value"] = 999
+    again = routes._read_json(path, run_id="run_cache")
+    assert again["value"] == 1
+    time.sleep(0.01)
+    path.write_text(json.dumps({"value": 2}), encoding="utf-8")
+    os.utime(path, None)
+    updated = routes._read_json(path, run_id="run_cache")
+    assert updated["value"] == 2
+
+
+def test_mutation_api_key_guard(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260303T000000Z_auth"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"run_id": run_id, "artifacts": ["manifest.json"]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    monkeypatch.setenv("REGIME_API_KEY", "secret")
+    client = TestClient(app)
+
+    missing_pin = client.post(f"/runs/{run_id}/pin")
+    assert missing_pin.status_code == 401
+    ok_pin = client.post(f"/runs/{run_id}/pin", headers={"X-API-Key": "secret"})
+    assert ok_pin.status_code == 200
+
+    missing_tags = client.put(f"/runs/{run_id}/tags", json={"tags": ["x"]})
+    assert missing_tags.status_code == 401
+    ok_tags = client.put(
+        f"/runs/{run_id}/tags",
+        json={"tags": ["x"]},
+        headers={"X-API-Key": "secret"},
+    )
+    assert ok_tags.status_code == 200
+
+
+def test_forecast_eval_endpoints(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260303T000000Z_forecast_eval"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "interval": 0.95,
+        "window": 120,
+        "horizons": [
+            {"horizon": 1, "n_samples": 100, "mae": 0.01, "coverage": 0.93},
+            {"horizon": 2, "n_samples": 99, "mae": 0.012, "coverage": 0.92},
+        ],
+    }
+    (run_dir / "forecast_eval.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    by_id = client.get(f"/runs/{run_id}/forecast_eval")
+    assert by_id.status_code == 200
+    assert by_id.json()["run_id"] == run_id
+
+    latest = client.get("/runs/latest/forecast_eval")
+    assert latest.status_code == 200
+    assert latest.json()["run_id"] == run_id
+
+
+def test_drift_endpoint(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_a = runs_root / "run_20260303T000000Z_da"
+    run_b = runs_root / "run_20260304T000000Z_db"
+    run_a.mkdir(parents=True, exist_ok=True)
+    run_b.mkdir(parents=True, exist_ok=True)
+
+    eval_a = {
+        "metrics": {"best_val_log_likelihood": 1.0},
+        "regime_diagnostics": {"transition_entropy": 0.5},
+        "event_classifier_summary": {
+            "event_counts_by_label": {"low_vol": 2, "shock": 1},
+            "avg_event_duration_days_by_label": {"low_vol": 10.0, "shock": 2.0},
+        },
+    }
+    eval_b = {
+        "metrics": {"best_val_log_likelihood": 2.0},
+        "regime_diagnostics": {"transition_entropy": 0.8},
+        "event_classifier_summary": {
+            "event_counts_by_label": {"low_vol": 1, "shock": 3},
+            "avg_event_duration_days_by_label": {"low_vol": 5.0, "shock": 4.0},
+        },
+    }
+    summary_a = {
+        "regimes": [
+            {"label": "low_vol", "avg_posterior_probability": 0.9},
+            {"label": "shock", "avg_posterior_probability": 0.1},
+        ]
+    }
+    summary_b = {
+        "regimes": [
+            {"label": "low_vol", "avg_posterior_probability": 0.7},
+            {"label": "shock", "avg_posterior_probability": 0.3},
+        ]
+    }
+    plot_meta_a = {"occupancies_by_label": {"low_vol": 0.8, "shock": 0.2}}
+    plot_meta_b = {"occupancies_by_label": {"low_vol": 0.6, "shock": 0.4}}
+
+    (run_a / "evaluation.json").write_text(json.dumps(eval_a), encoding="utf-8")
+    (run_b / "evaluation.json").write_text(json.dumps(eval_b), encoding="utf-8")
+    (run_a / "regime_summary.json").write_text(json.dumps(summary_a), encoding="utf-8")
+    (run_b / "regime_summary.json").write_text(json.dumps(summary_b), encoding="utf-8")
+    (run_a / "plot_meta.json").write_text(json.dumps(plot_meta_a), encoding="utf-8")
+    (run_b / "plot_meta.json").write_text(json.dumps(plot_meta_b), encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    response = client.post("/runs/drift", json={"run_a": run_a.name, "run_b": run_b.name})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_a"] == run_a.name
+    assert payload["run_b"] == run_b.name
+    assert payload["deltas"]["delta_best_val_ll"] == 1.0
+    assert payload["deltas"]["delta_transition_entropy"] == 0.30000000000000004
+    assert payload["deltas"]["delta_shock_occupancy"] == 0.19999999999999998
+    assert isinstance(payload["deltas"]["occupancy_kl_divergence"], float)
+    assert payload["event_deltas"]["event_counts_by_label"]["shock"] == 2
+    assert payload["event_deltas"]["avg_event_duration_days_by_label"]["low_vol"] == -5.0
+
+
+def test_report_markdown_generation_and_alias(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260303T000000Z_report"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"run_id": run_id, "artifacts": ["manifest.json"]}),
+        encoding="utf-8",
+    )
+    (run_dir / "evaluation.json").write_text(
+        json.dumps(
+            {
+                "metrics": {"best_val_log_likelihood": 3.0, "epochs_ran": 10, "stopped_early": False},
+                "regime_diagnostics": {
+                    "transition_entropy": 0.4,
+                    "regimes": [{"label": "shock", "avg_posterior_probability": 0.2}],
+                },
+                "event_classifier_summary": {
+                    "event_counts_by_label": {"shock": 1},
+                    "avg_event_duration_days_by_label": {"shock": 2.0},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "events.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "n_events": 1,
+                "events": [
+                    {
+                        "segment_index": 0,
+                        "state": 2,
+                        "label": "shock",
+                        "start_idx": 0,
+                        "end_idx": 1,
+                        "start_date": "2026-03-01",
+                        "end_date": "2026-03-02",
+                        "length": 2,
+                        "duration_days": 2,
+                        "cumulative_log_return": -0.05,
+                        "mean_return": -0.025,
+                        "realized_vol": 0.01,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "viterbi_states.json").write_text(
+        json.dumps({"dates": ["2026-03-02"], "states": [2], "labels": ["shock"]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    response = client.get(f"/runs/{run_id}/report.md")
+    assert response.status_code == 200
+    assert "# Run Report:" in response.text
+    assert "## Scorecard" in response.text
+    assert "## Top Events" in response.text
+    assert (run_dir / "report.md").exists()
+
+    latest = client.get("/runs/latest/report.md")
+    assert latest.status_code == 200
+    assert "# Run Report:" in latest.text
+
+
+def test_report_generation_for_frozen_run_does_not_write(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260303T000000Z_frozen_report"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "frozen.json").write_text(json.dumps({"frozen": True, "reason": "hold"}), encoding="utf-8")
+    (run_dir / "evaluation.json").write_text(
+        json.dumps(
+            {
+                "metrics": {"best_val_log_likelihood": 1.0},
+                "regime_diagnostics": {"transition_entropy": 0.2, "regimes": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "events.json").write_text(
+        json.dumps({"run_id": run_id, "n_events": 0, "events": []}),
+        encoding="utf-8",
+    )
+    (run_dir / "viterbi_states.json").write_text(
+        json.dumps({"dates": ["2026-03-02"], "states": [0], "labels": ["low_vol"]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    response = client.get(f"/runs/{run_id}/report.md")
+    assert response.status_code == 200
+    assert "# Run Report:" in response.text
+    assert not (run_dir / "report.md").exists()
+
+
+def test_trash_management_endpoints(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    trash_root = runs_root / "_trash"
+    trash_root.mkdir(parents=True, exist_ok=True)
+    trash_a = "run_20260301T000000Z_alpha_20260302T120000Z"
+    trash_b = "run_20260301T000000Z_beta_20260303T120000Z"
+    (trash_root / trash_a).mkdir()
+    (trash_root / trash_b).mkdir()
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    list_resp = client.get("/runs/trash")
+    assert list_resp.status_code == 200
+    items = list_resp.json()["trash"]
+    assert [item["trash_id"] for item in items] == [trash_b, trash_a]
+    assert items[0]["original_run_id"] == "run_20260301T000000Z_beta"
+    assert items[0]["deleted_at_utc"].startswith("2026-03-03T12:00:00")
+    assert items[0]["path"].endswith(trash_b)
+
+    paged_resp = client.get("/runs/trash?order=asc&limit=1&offset=1")
+    assert paged_resp.status_code == 200
+    assert [item["trash_id"] for item in paged_resp.json()["trash"]] == [trash_b]
+
+    get_resp = client.get(f"/runs/trash/{trash_a}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["trash_id"] == trash_a
+
+    purge_resp = client.delete(f"/runs/trash/{trash_a}")
+    assert purge_resp.status_code == 200
+    assert purge_resp.json()["purged"] is True
+    assert not (trash_root / trash_a).exists()
+
+    invalid_order = client.get("/runs/trash?order=bad")
+    assert invalid_order.status_code == 400
+
+
+def test_notes_and_mutations_endpoints(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260304T000000Z_notes"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"run_id": run_id, "artifacts": ["manifest.json"]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    missing_notes = client.get(f"/runs/{run_id}/notes")
+    assert missing_notes.status_code == 404
+
+    put_resp = client.put(
+        f"/runs/{run_id}/notes",
+        json={"content": "# Deployment Notes\nall good"},
+    )
+    assert put_resp.status_code == 200
+    assert put_resp.json()["run_id"] == run_id
+    assert (run_dir / "notes.md").exists()
+
+    notes_resp = client.get(f"/runs/{run_id}/notes")
+    assert notes_resp.status_code == 200
+    assert "Deployment Notes" in notes_resp.json()["content"]
+
+    mutations_resp = client.get(f"/runs/{run_id}/mutations")
+    assert mutations_resp.status_code == 200
+    mutations = mutations_resp.json()["mutations"]
+    assert len(mutations) == 1
+    assert mutations[0]["action"] == "notes.put"
+
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert "notes.md" in manifest["artifacts"]
+    assert "mutations.json" in manifest["artifacts"]
+    assert "notes.md" in manifest["artifacts_sha256"]
+    assert "mutations.json" in manifest["artifacts_sha256"]
+
+
+def test_notes_put_respects_freeze_and_auth(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260304T000000Z_notes_auth"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"run_id": run_id, "artifacts": ["manifest.json"]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    monkeypatch.setenv("REGIME_API_KEY", "secret")
+    client = TestClient(app)
+
+    unauthorized = client.put(f"/runs/{run_id}/notes", json={"content": "x"})
+    assert unauthorized.status_code == 401
+
+    authorized = client.put(
+        f"/runs/{run_id}/notes",
+        json={"content": "x"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert authorized.status_code == 200
+
+    freeze_resp = client.post(
+        f"/runs/{run_id}/freeze",
+        json={"reason": "release lock"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert freeze_resp.status_code == 200
+
+    frozen_put = client.put(
+        f"/runs/{run_id}/notes",
+        json={"content": "y"},
+        headers={"X-API-Key": "secret"},
+    )
+    assert frozen_put.status_code == 409
+    assert run_id in frozen_put.json()["detail"]
+
+
+def test_bundle_zip_rejects_integrity_mismatch(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260304T000000Z_bundle_bad"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "a.json").write_text('{"a":1}', encoding="utf-8")
+    bad_hash = "0" * 64
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "schema_version": 1,
+                "artifacts": ["manifest.json", "a.json"],
+                "artifacts_sha256": {"a.json": bad_hash},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    resp = client.get(f"/runs/{run_id}/bundle.zip?artifacts=a.json")
+    assert resp.status_code == 409
+    assert "integrity" in resp.json()["detail"]
+
+
+def test_forecast_v3_endpoint(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_id = "run_20260304T000000Z_fcastv3"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "model_params.json").write_text(
+        json.dumps(
+            {
+                "n_states": 3,
+                "initial_probs": [0.3, 0.4, 0.3],
+                "transition_matrix": [
+                    [0.9, 0.08, 0.02],
+                    [0.1, 0.8, 0.1],
+                    [0.2, 0.2, 0.6],
+                ],
+                "mu": [0.001, 0.0, -0.01],
+                "sigma": [0.01, 0.015, 0.04],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "regime_labels.json").write_text(
+        json.dumps({"label_mapping": {"0": "low_vol", "1": "mid_vol", "2": "shock"}}),
+        encoding="utf-8",
+    )
+    (run_dir / "predict_proba.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-03-03", "2026-03-04"],
+                "returns": [0.01, -0.02],
+                "regime_probabilities": [[0.2, 0.3, 0.5], [0.1, 0.7, 0.2]],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    missing_id = "run_20260305T000000Z_fcastv3_missing"
+    missing_dir = runs_root / missing_id
+    missing_dir.mkdir(parents=True, exist_ok=True)
+    (missing_dir / "predict_proba.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-03-03"],
+                "returns": [0.01],
+                "regime_probabilities": [[0.3, 0.4, 0.3]],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    resp = client.get(f"/forecast_v3?run_id={run_id}&horizon=3")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["run_id"] == run_id
+    assert payload["horizon"] == 3
+    assert len(payload["forecast"]) == 3
+    first = payload["forecast"][0]
+    assert "probs_by_label" in first
+    assert "raw_state_probs" in first
+    assert "expected_return" in first
+    assert "expected_vol" in first
+    assert "interval_low" in first
+    assert "interval_high" in first
+
+    missing_resp = client.get(f"/forecast_v3?run_id={missing_id}&horizon=2")
+    assert missing_resp.status_code == 404
+    assert "model_params.json" in missing_resp.json()["detail"]
+
+
+def test_alerts_evaluate_endpoint(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_target = runs_root / "run_20260304T000000Z_alert_target"
+    run_base = runs_root / "run_20260303T000000Z_alert_base"
+    run_target.mkdir(parents=True, exist_ok=True)
+    run_base.mkdir(parents=True, exist_ok=True)
+
+    (run_target / "regime_summary.json").write_text(
+        json.dumps(
+            {
+                "regimes": [
+                    {"label": "low_vol", "avg_posterior_probability": 0.4},
+                    {"label": "mid_vol", "avg_posterior_probability": 0.2},
+                    {"label": "shock", "avg_posterior_probability": 0.4},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_target / "evaluation.json").write_text(
+        json.dumps({"regime_diagnostics": {"transition_entropy": 1.0}}),
+        encoding="utf-8",
+    )
+    (run_target / "forecast_eval.json").write_text(
+        json.dumps({"horizons": [{"horizon": 1, "coverage": 0.7}]}),
+        encoding="utf-8",
+    )
+    (run_base / "evaluation.json").write_text(
+        json.dumps({"regime_diagnostics": {"transition_entropy": 0.2}}),
+        encoding="utf-8",
+    )
+    (runs_root / "pinned_run.txt").write_text(run_base.name, encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    resp = client.post("/alerts/evaluate", json={"run_id": run_target.name})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["run_id"] == run_target.name
+    ids = {row["id"] for row in payload["alerts"]}
+    assert "shock_occupancy_high" in ids
+    assert "forecast_coverage_low" in ids
+    assert "transition_entropy_jump" in ids
+
+
+def test_compare_view_endpoint(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_a = runs_root / "run_20260304T000000Z_cmp_a"
+    run_b = runs_root / "run_20260305T000000Z_cmp_b"
+    run_a.mkdir(parents=True, exist_ok=True)
+    run_b.mkdir(parents=True, exist_ok=True)
+
+    eval_a = {
+        "metrics": {"best_val_log_likelihood": 1.0, "test_avg_log_likelihood": 0.5},
+        "regime_diagnostics": {"transition_entropy": 0.3},
+        "event_classifier_summary": {
+            "event_counts_by_label": {"low_vol": 2, "shock": 1},
+            "avg_event_duration_days_by_label": {"low_vol": 5.0, "shock": 2.0},
+        },
+    }
+    eval_b = {
+        "metrics": {"best_val_log_likelihood": 1.5, "test_avg_log_likelihood": 0.6},
+        "regime_diagnostics": {"transition_entropy": 0.6},
+        "event_classifier_summary": {
+            "event_counts_by_label": {"low_vol": 1, "shock": 2},
+            "avg_event_duration_days_by_label": {"low_vol": 4.0, "shock": 3.0},
+        },
+    }
+    summary_a = {
+        "regimes": [
+            {"label": "low_vol", "avg_posterior_probability": 0.8},
+            {"label": "shock", "avg_posterior_probability": 0.2},
+        ]
+    }
+    summary_b = {
+        "regimes": [
+            {"label": "low_vol", "avg_posterior_probability": 0.6},
+            {"label": "shock", "avg_posterior_probability": 0.4},
+        ]
+    }
+    transition_stub = {"transition_matrix": [[0.9, 0.1], [0.2, 0.8]]}
+
+    (run_a / "evaluation.json").write_text(json.dumps(eval_a), encoding="utf-8")
+    (run_b / "evaluation.json").write_text(json.dumps(eval_b), encoding="utf-8")
+    (run_a / "regime_summary.json").write_text(json.dumps(summary_a), encoding="utf-8")
+    (run_b / "regime_summary.json").write_text(json.dumps(summary_b), encoding="utf-8")
+    (run_a / "transition_matrix.json").write_text(json.dumps(transition_stub), encoding="utf-8")
+    (run_b / "transition_matrix.json").write_text(json.dumps(transition_stub), encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    resp = client.get(f"/runs/{run_a.name}/compare/{run_b.name}")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["run_a"] == run_a.name
+    assert payload["run_b"] == run_b.name
+    assert "drift" in payload
+    assert "metrics_diff" in payload
+    assert "events_diff" in payload

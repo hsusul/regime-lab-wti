@@ -5,9 +5,14 @@ from __future__ import annotations
 import io
 import html
 import json
+import os
+import copy
+import shutil
+import subprocess
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any, Optional
 
 import numpy as np
@@ -21,12 +26,50 @@ from models.infer import (
     probability_weighted_moments,
 )
 from models.provenance import sha256_file as _sha256_file
+from models.provenance import DEFAULT_SCHEMA_VERSION
 from models.provenance import write_manifest_with_provenance
 from models.train import resolve_run_dir, train_model_run
 
 router = APIRouter()
 RUNS_ROOT = Path("runs")
 PINNED_RUN_FILENAME = "pinned_run.txt"
+TRASH_DIRNAME = "_trash"
+API_VERSION = "0.1.0"
+SCHEMA_VERSION = int(DEFAULT_SCHEMA_VERSION)
+BUILT_AT_UTC = datetime.now(timezone.utc).isoformat()
+_JSON_CACHE_FILENAMES = {
+    "manifest.json",
+    "regime_summary.json",
+    "evaluation.json",
+    "model_params.json",
+    "events.json",
+    "plot_meta.json",
+}
+_JSON_READ_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
+_MODEL_PARAMS_CACHE: dict[str, tuple[int, dict[str, np.ndarray]]] = {}
+
+
+def _safe_git_commit_hash() -> str | None:
+    env_hash = os.getenv("GIT_COMMIT_HASH")
+    if env_hash:
+        return env_hash.strip() or None
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            return None
+        commit = completed.stdout.strip()
+        return commit if commit else None
+    except Exception:
+        return None
+
+
+GIT_COMMIT_HASH = _safe_git_commit_hash()
 
 
 class FitRequest(BaseModel):
@@ -70,6 +113,27 @@ class TransitionAlertRequest(BaseModel):
     from_label: str | None = Field(default=None)
     to_label: str | None = Field(default=None)
     lookback_days: int = Field(default=30, ge=1, le=3650)
+
+
+class DriftRequest(BaseModel):
+    """Request payload for run-to-run drift comparison."""
+
+    run_a: str
+    run_b: str
+
+
+class RunNotesRequest(BaseModel):
+    """Request payload for freeform run notes."""
+
+    content: str = Field(default="")
+
+
+class AlertsEvaluateRequest(BaseModel):
+    """Request payload for rule-based alert evaluation."""
+
+    run_id: str | None = Field(default=None)
+    use_pinned: bool = Field(default=False)
+    rules: dict[str, Any] | None = Field(default=None)
 
 
 class EventSegmentResponse(BaseModel):
@@ -181,6 +245,17 @@ def fit_model(request: FitRequest) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/version")
+def version() -> dict[str, Any]:
+    """Return API/version metadata."""
+    return {
+        "api_version": API_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "git_commit_hash": GIT_COMMIT_HASH,
+        "built_at_utc": BUILT_AT_UTC,
+    }
+
+
 @router.get("/runs")
 def list_runs(
     request: Request,
@@ -215,8 +290,9 @@ def pinned_run() -> dict[str, str]:
 
 
 @router.post("/runs/{run_id}/pin")
-def pin_run(run_id: str) -> dict[str, str]:
+def pin_run(run_id: str, request: Request) -> dict[str, str]:
     """Pin a specific run id for production-style workflows."""
+    _require_mutation_auth(request)
     _validate_run_id_for_pin(run_id)
     run_path = RUNS_ROOT / run_id
     if not run_path.exists() or not run_path.is_dir():
@@ -227,8 +303,9 @@ def pin_run(run_id: str) -> dict[str, str]:
 
 
 @router.post("/runs/unpin")
-def unpin_run() -> dict[str, bool]:
+def unpin_run(request: Request) -> dict[str, bool]:
     """Remove pinned run pointer if present."""
+    _require_mutation_auth(request)
     pinned_path = _pinned_run_file()
     if not pinned_path.exists():
         return {"unpinned": False}
@@ -236,12 +313,105 @@ def unpin_run() -> dict[str, bool]:
     return {"unpinned": True}
 
 
+@router.delete("/runs/{run_id}")
+def delete_run(run_id: str, request: Request) -> dict[str, Any]:
+    """Soft-delete a run by moving it under runs/_trash/."""
+    _require_mutation_auth(request)
+    run_path = _resolve_run_path(run_id)
+    if _read_pinned_run_id_or_none() == run_id:
+        raise HTTPException(status_code=409, detail=f"Run {run_id} is pinned and cannot be deleted")
+    if _is_run_frozen(run_path):
+        raise HTTPException(status_code=409, detail=f"Run {run_id} is frozen and cannot be deleted")
+
+    trash_root = _trash_root()
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    trash_id = f"{run_id}_{ts}"
+    trash_path = trash_root / trash_id
+    run_path.rename(trash_path)
+    _reconcile_latest_pointer()
+    return {
+        "run_id": run_id,
+        "trash_id": trash_id,
+        "trash_dir": str(trash_path),
+    }
+
+
+@router.post("/runs/trash/{trash_id}/restore")
+def restore_run(trash_id: str, request: Request) -> dict[str, Any]:
+    """Restore a previously trashed run back under runs/."""
+    _require_mutation_auth(request)
+    trash_path = _trash_root() / trash_id
+    if not trash_path.exists() or not trash_path.is_dir():
+        raise HTTPException(status_code=404, detail=f"Trash entry not found: {trash_id}")
+
+    restored_run_id = _extract_run_id_from_trash_id(trash_id)
+    if restored_run_id is None:
+        raise HTTPException(status_code=400, detail=f"Invalid trash id: {trash_id}")
+
+    restored_path = RUNS_ROOT / restored_run_id
+    if restored_path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot restore {trash_id}: destination run already exists ({restored_run_id})",
+        )
+
+    trash_path.rename(restored_path)
+    _reconcile_latest_pointer()
+    return {
+        "restored_run_id": restored_run_id,
+        "run_dir": str(restored_path),
+        "trash_id": trash_id,
+    }
+
+
+@router.get("/runs/trash")
+def list_trashed_runs(
+    request: Request,
+    limit: int = Query(default=25, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    order: str = Query(default="desc"),
+) -> dict[str, Any]:
+    """List trash entries with pagination and ordering."""
+    trash_ids = _list_trash_ids(order=order)
+    start = min(offset, len(trash_ids))
+    if "limit" in request.query_params:
+        end = min(start + limit, len(trash_ids))
+    else:
+        end = len(trash_ids)
+    items = [_trash_item_payload(trash_id) for trash_id in trash_ids[start:end]]
+    return {"trash": items}
+
+
+@router.get("/runs/trash/{trash_id}")
+def get_trashed_run(trash_id: str) -> dict[str, Any]:
+    """Return metadata for a single trash entry."""
+    return _trash_item_payload(trash_id)
+
+
+@router.delete("/runs/trash/{trash_id}")
+def purge_trashed_run(trash_id: str, request: Request) -> dict[str, Any]:
+    """Permanently delete a trash entry from disk."""
+    _require_mutation_auth(request)
+    trash_path = _trash_root() / trash_id
+    if not trash_path.exists() or not trash_path.is_dir():
+        raise HTTPException(status_code=404, detail=f"Trash entry not found: {trash_id}")
+    item = _trash_item_payload(trash_id)
+    shutil.rmtree(trash_path)
+    return {
+        "trash_id": trash_id,
+        "original_run_id": item.get("original_run_id"),
+        "purged": True,
+    }
+
+
 @router.get("/runs/latest")
 def latest_run() -> dict[str, Any]:
     """Return lightweight metadata for the newest run."""
     run_id = _latest_run_id_or_404()
     run_path = _resolve_run_path(run_id)
-    return _latest_run_payload(run_id, run_path)
+    payload = _latest_run_payload(run_id, run_path)
+    payload.update(_version_fields())
+    return payload
 
 
 @router.get("/runs/latest/summary")
@@ -258,6 +428,14 @@ def latest_run_evaluation() -> dict[str, Any]:
     run_id = _latest_run_id_or_404()
     run_path = _resolve_run_path(run_id)
     return _read_json(run_path / "evaluation.json", run_id=run_id)
+
+
+@router.get("/runs/latest/forecast_eval")
+def latest_run_forecast_eval() -> dict[str, Any]:
+    """Return forecast evaluation artifact for latest run."""
+    run_id = _latest_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return _read_json(run_path / "forecast_eval.json", run_id=run_id)
 
 
 @router.get("/runs/latest/scorecard", response_model=ScorecardResponseModel)
@@ -291,6 +469,14 @@ def latest_run_plot_path() -> dict[str, str]:
     return {"run_id": run_id, "plot_path": str(plot_path)}
 
 
+@router.get("/runs/latest/report.md")
+def latest_run_report_markdown() -> Response:
+    """Return markdown report for latest run."""
+    run_id = _latest_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return _report_markdown_response(run_id=run_id, run_path=run_path)
+
+
 
 @router.get("/runs/{run_id}/summary")
 def run_summary(run_id: str) -> dict[str, Any]:
@@ -304,6 +490,13 @@ def run_evaluation(run_id: str) -> dict[str, Any]:
     """Return evaluation artifact for a specific run id."""
     run_path = _resolve_run_path(run_id)
     return _read_json(run_path / "evaluation.json", run_id=run_id)
+
+
+@router.get("/runs/{run_id}/forecast_eval")
+def run_forecast_eval(run_id: str) -> dict[str, Any]:
+    """Return forecast evaluation artifact for a specific run id."""
+    run_path = _resolve_run_path(run_id)
+    return _read_json(run_path / "forecast_eval.json", run_id=run_id)
 
 
 @router.get("/runs/{run_id}/scorecard", response_model=ScorecardResponseModel)
@@ -346,6 +539,13 @@ def run_plot_html(run_id: str) -> Response:
     return Response(content=html, media_type="text/html; charset=utf-8")
 
 
+@router.get("/runs/{run_id}/report.md")
+def run_report_markdown(run_id: str) -> Response:
+    """Return markdown report for a specific run."""
+    run_path = _resolve_run_path(run_id)
+    return _report_markdown_response(run_id=run_id, run_path=run_path)
+
+
 @router.get("/runs/{run_id}/artifacts")
 def run_artifacts(run_id: str) -> dict[str, Any]:
     """Return available artifact filenames for a run."""
@@ -372,12 +572,25 @@ def download_run_artifact(run_id: str, name: str) -> Response:
 @router.get("/runs/{run_id}/bundle.zip")
 def download_run_bundle(
     run_id: str,
+    request: Request,
     artifacts: str | None = Query(default=None),
 ) -> StreamingResponse:
     """Download selected run artifacts as a zip bundle."""
     run_path = _resolve_run_path(run_id)
+    manifest = _read_json(run_path / "manifest.json", run_id=run_id)
+    integrity = _run_integrity_payload(run_id=run_id, run_path=run_path, manifest=manifest)
+    if not integrity["ok"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Run {run_id} failed integrity check before bundle: "
+                f"missing={integrity['missing']} mismatched={integrity['mismatched']}"
+            ),
+        )
+
+    generated_names = {"report.md", "report.html", "openapi.json", "RUN_INFO.json"}
+    generated_artifacts: dict[str, bytes] = {}
     if artifacts is None:
-        manifest = _read_json(run_path / "manifest.json", run_id=run_id)
         names_raw = manifest.get("artifacts", [])
         if not isinstance(names_raw, list):
             raise HTTPException(
@@ -385,26 +598,51 @@ def download_run_bundle(
                 detail=f"Run {run_id} has malformed artifact: manifest.json",
             )
         artifact_names = [str(name) for name in names_raw]
+        generated_artifacts = _build_bundle_generated_artifacts(
+            run_id=run_id,
+            run_path=run_path,
+            request=request,
+        )
+        artifact_names.extend(generated_artifacts.keys())
     else:
         artifact_names = [name.strip() for name in artifacts.split(",") if name.strip()]
+        if any(name in generated_names for name in artifact_names):
+            generated_artifacts = _build_bundle_generated_artifacts(
+                run_id=run_id,
+                run_path=run_path,
+                request=request,
+            )
 
     if not artifact_names:
         raise HTTPException(status_code=400, detail=f"Run {run_id} has no artifacts to bundle")
+    deduped_names: list[str] = []
+    seen: set[str] = set()
     for name in artifact_names:
         if Path(name).name != name:
             raise HTTPException(
                 status_code=400,
                 detail=f"Run {run_id} has invalid artifact name in request: {name}",
             )
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped_names.append(name)
 
-    missing = [name for name in artifact_names if not (run_path / name).exists()]
+    missing = [
+        name
+        for name in deduped_names
+        if name not in generated_artifacts and not (run_path / name).exists()
+    ]
     if missing:
         raise _artifact_not_found(run_id, missing)
 
     total_bytes = 0
-    for name in artifact_names:
+    for name in deduped_names:
+        if name in generated_artifacts:
+            total_bytes += len(generated_artifacts[name])
+            continue
         path = run_path / name
-        if path.is_file():
+        if path.exists() and path.is_file():
             total_bytes += path.stat().st_size
     max_bytes = 25 * 1024 * 1024
     if total_bytes > max_bytes:
@@ -415,7 +653,10 @@ def download_run_bundle(
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name in artifact_names:
+        for name in deduped_names:
+            if name in generated_artifacts:
+                zf.writestr(name, generated_artifacts[name])
+                continue
             path = run_path / name
             if path.is_file():
                 zf.writestr(name, path.read_bytes())
@@ -435,8 +676,9 @@ def get_run_tags(run_id: str) -> dict[str, Any]:
 
 
 @router.put("/runs/{run_id}/tags")
-def put_run_tags(run_id: str, request: RunTagsRequest) -> dict[str, Any]:
+def put_run_tags(run_id: str, request: RunTagsRequest, raw_request: Request) -> dict[str, Any]:
     """Create or update tags metadata for a run and stamp manifest provenance."""
+    _require_mutation_auth(raw_request)
     run_path = _resolve_run_path(run_id)
     _assert_run_not_frozen(run_id=run_id, run_path=run_path, action="update tags")
     tags = sorted({str(tag).strip() for tag in request.tags if str(tag).strip()})
@@ -450,9 +692,62 @@ def put_run_tags(run_id: str, request: RunTagsRequest) -> dict[str, Any]:
     return payload
 
 
+@router.get("/runs/{run_id}/notes")
+def get_run_notes(run_id: str) -> dict[str, Any]:
+    """Return freeform notes markdown for a run."""
+    run_path = _resolve_run_path(run_id)
+    notes_path = run_path / "notes.md"
+    if not notes_path.exists():
+        raise _artifact_not_found(run_id, [notes_path.name])
+    return {"run_id": run_id, "content": notes_path.read_text(encoding="utf-8")}
+
+
+@router.put("/runs/{run_id}/notes")
+def put_run_notes(run_id: str, request: RunNotesRequest, raw_request: Request) -> dict[str, Any]:
+    """Create or update notes.md and append to the run mutation audit log."""
+    _require_mutation_auth(raw_request)
+    run_path = _resolve_run_path(run_id)
+    _assert_run_not_frozen(run_id=run_id, run_path=run_path, action="update notes")
+
+    notes_path = run_path / "notes.md"
+    notes_path.write_text(request.content, encoding="utf-8")
+    _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="notes.md")
+
+    mutation = _append_run_mutation(
+        run_id=run_id,
+        run_path=run_path,
+        action="notes.put",
+        details={"content_length": len(request.content)},
+    )
+    return {
+        "run_id": run_id,
+        "content": request.content,
+        "updated_at_utc": mutation["at_utc"],
+    }
+
+
+@router.get("/runs/{run_id}/mutations")
+def get_run_mutations(run_id: str) -> dict[str, Any]:
+    """Return append-only mutation entries for a run."""
+    run_path = _resolve_run_path(run_id)
+    mutation_path = run_path / "mutations.json"
+    if not mutation_path.exists():
+        return {"run_id": run_id, "mutations": []}
+    payload = _read_json(mutation_path, run_id=run_id)
+    mutations = payload.get("mutations", [])
+    if not isinstance(mutations, list):
+        mutations = []
+    return {"run_id": run_id, "mutations": mutations}
+
+
 @router.post("/runs/{run_id}/freeze")
-def freeze_run(run_id: str, request: FreezeRunRequest | None = None) -> dict[str, Any]:
+def freeze_run(
+    run_id: str,
+    raw_request: Request,
+    request: FreezeRunRequest | None = None,
+) -> dict[str, Any]:
     """Freeze a run to prevent mutating artifacts inside run dir."""
+    _require_mutation_auth(raw_request)
     run_path = _resolve_run_path(run_id)
     reason = request.reason if request is not None else None
     payload = {
@@ -466,8 +761,9 @@ def freeze_run(run_id: str, request: FreezeRunRequest | None = None) -> dict[str
 
 
 @router.post("/runs/{run_id}/unfreeze")
-def unfreeze_run(run_id: str) -> dict[str, Any]:
+def unfreeze_run(run_id: str, request: Request) -> dict[str, Any]:
     """Unfreeze a run by deleting frozen.json when present."""
+    _require_mutation_auth(request)
     run_path = _resolve_run_path(run_id)
     frozen_path = run_path / "frozen.json"
     if not frozen_path.exists():
@@ -480,6 +776,7 @@ def unfreeze_run(run_id: str) -> dict[str, Any]:
         if isinstance(artifacts, list) and "frozen.json" in artifacts:
             manifest["artifacts"] = [name for name in artifacts if name != "frozen.json"]
             write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest)
+            _invalidate_json_cache(run_path / "manifest.json")
     return {"run_id": run_id, "unfrozen": True}
 
 
@@ -488,51 +785,7 @@ def run_integrity(run_id: str) -> dict[str, Any]:
     """Verify manifest artifact hashes against files on disk."""
     run_path = _resolve_run_path(run_id)
     manifest = _read_json(run_path / "manifest.json", run_id=run_id)
-    schema_version = manifest.get("schema_version")
-    artifacts = manifest.get("artifacts", [])
-    expected = manifest.get("artifacts_sha256", {})
-    if schema_version is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Run {run_id} has malformed manifest.json: missing schema_version",
-        )
-    if not isinstance(artifacts, list) or not isinstance(expected, dict):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Run {run_id} has malformed manifest.json",
-        )
-
-    missing: list[str] = []
-    mismatched: list[dict[str, str]] = []
-    for artifact_name in artifacts:
-        name = str(artifact_name)
-        path = run_path / name
-        if name == "manifest.json":
-            continue
-        if not path.exists() or not path.is_file():
-            missing.append(name)
-            continue
-        expected_hash = expected.get(name)
-        actual_hash = _sha256_file(path)
-        if expected_hash is None:
-            missing.append(name)
-            continue
-        if str(expected_hash) != actual_hash:
-            mismatched.append(
-                {
-                    "name": name,
-                    "expected": str(expected_hash),
-                    "actual": actual_hash,
-                }
-            )
-
-    return {
-        "run_id": run_id,
-        "ok": len(missing) == 0 and len(mismatched) == 0,
-        "missing": missing,
-        "mismatched": mismatched,
-        "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
+    return _run_integrity_payload(run_id=run_id, run_path=run_path, manifest=manifest)
 
 
 @router.get("/runs/{run_id}/manifest")
@@ -547,6 +800,28 @@ def run_model(run_id: str) -> dict[str, Any]:
     """Return compact model parameters for a run."""
     run_path = _resolve_run_path(run_id)
     return _read_json(run_path / "model_params.json", run_id=run_id)
+
+
+@router.get("/runs/{run_id}/compare/{other_run_id}")
+def compare_run_pair(run_id: str, other_run_id: str) -> dict[str, Any]:
+    """Return compare and drift payloads for a fixed run pair."""
+    run_a_path = _resolve_run_path(run_id)
+    run_b_path = _resolve_run_path(other_run_id)
+    compare_payload = _compare_runs_payload([run_id, other_run_id])
+    drift_payload = _build_drift_payload(
+        run_a=run_id,
+        run_b=other_run_id,
+        run_a_path=run_a_path,
+        run_b_path=run_b_path,
+    )
+    return {
+        "run_a": run_id,
+        "run_b": other_run_id,
+        "drift": drift_payload,
+        "metrics_diff": compare_payload.get("diffs", {}),
+        "events_diff": drift_payload.get("event_deltas", {}),
+        "compare": compare_payload,
+    }
 
 
 @router.post("/runs/compare")
@@ -566,6 +841,16 @@ def compare_pinned_latest() -> dict[str, Any]:
     payload["pinned_run_id"] = pinned
     payload["latest_run_id"] = latest
     return payload
+
+
+@router.post("/runs/drift")
+def drift_runs(request: DriftRequest) -> dict[str, Any]:
+    """Compute artifact-based drift metrics between two runs."""
+    run_a = request.run_a
+    run_b = request.run_b
+    run_a_path = _resolve_run_path(run_a)
+    run_b_path = _resolve_run_path(run_b)
+    return _build_drift_payload(run_a=run_a, run_b=run_b, run_a_path=run_a_path, run_b_path=run_b_path)
 
 
 @router.post("/alerts/transition")
@@ -623,6 +908,130 @@ def transition_alerts(request: TransitionAlertRequest) -> dict[str, Any]:
     }
 
 
+@router.post("/alerts/evaluate")
+def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
+    """Evaluate simple artifact-based alert rules for a run."""
+    run_id = _resolve_effective_run_id(run_id=request.run_id, use_pinned=request.use_pinned)
+    run_path = _resolve_run_path(run_id)
+    summary = _read_json(run_path / "regime_summary.json", run_id=run_id)
+    evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
+
+    defaults: dict[str, Any] = {
+        "shock_occupancy_threshold": 0.25,
+        "transition_entropy_jump_threshold": 0.15,
+        "coverage_threshold": 0.9,
+        "coverage_horizon": 1,
+    }
+    rules = {**defaults, **(request.rules or {})}
+
+    alerts: list[dict[str, Any]] = []
+
+    shock_occupancy = _shock_occupancy(summary)
+    shock_threshold = _as_float_or_none(rules.get("shock_occupancy_threshold"))
+    if (
+        shock_occupancy is not None
+        and shock_threshold is not None
+        and shock_occupancy > shock_threshold
+    ):
+        alerts.append(
+            {
+                "id": "shock_occupancy_high",
+                "severity": "warning",
+                "message": (
+                    f"Shock occupancy {shock_occupancy:.4f} exceeds threshold {shock_threshold:.4f} for run {run_id}"
+                ),
+                "evidence": {
+                    "run_id": run_id,
+                    "shock_occupancy": shock_occupancy,
+                    "threshold": shock_threshold,
+                },
+            }
+        )
+
+    baseline_run_id: str | None = None
+    pinned_run_id = _read_pinned_run_id_or_none()
+    if pinned_run_id is not None and pinned_run_id != run_id:
+        baseline_run_id = pinned_run_id
+    else:
+        latest_run_id = _latest_run_id_or_404()
+        if latest_run_id != run_id:
+            baseline_run_id = latest_run_id
+
+    entropy_threshold = _as_float_or_none(rules.get("transition_entropy_jump_threshold"))
+    run_entropy = _as_float_or_none(evaluation.get("regime_diagnostics", {}).get("transition_entropy"))
+    if baseline_run_id is not None and entropy_threshold is not None and run_entropy is not None:
+        baseline_path = _resolve_run_path(baseline_run_id)
+        baseline_eval = _read_json(baseline_path / "evaluation.json", run_id=baseline_run_id)
+        baseline_entropy = _as_float_or_none(
+            baseline_eval.get("regime_diagnostics", {}).get("transition_entropy")
+        )
+        if baseline_entropy is not None:
+            jump = abs(run_entropy - baseline_entropy)
+            if jump > entropy_threshold:
+                alerts.append(
+                    {
+                        "id": "transition_entropy_jump",
+                        "severity": "warning",
+                        "message": (
+                            f"Transition entropy jump {jump:.4f} exceeds threshold {entropy_threshold:.4f} "
+                            f"(run {run_id} vs {baseline_run_id})"
+                        ),
+                        "evidence": {
+                            "run_id": run_id,
+                            "baseline_run_id": baseline_run_id,
+                            "run_transition_entropy": run_entropy,
+                            "baseline_transition_entropy": baseline_entropy,
+                            "abs_delta": jump,
+                            "threshold": entropy_threshold,
+                        },
+                    }
+                )
+
+    forecast_eval_path = run_path / "forecast_eval.json"
+    coverage_threshold = _as_float_or_none(rules.get("coverage_threshold"))
+    coverage_horizon = int(rules.get("coverage_horizon", 1))
+    if forecast_eval_path.exists() and coverage_threshold is not None:
+        forecast_eval = _read_json(forecast_eval_path, run_id=run_id)
+        horizons = forecast_eval.get("horizons", [])
+        selected: dict[str, Any] | None = None
+        if isinstance(horizons, list):
+            for row in horizons:
+                if int(row.get("horizon", -1)) == coverage_horizon:
+                    selected = row
+                    break
+        if selected is None and isinstance(horizons, list) and len(horizons) > 0:
+            selected = horizons[0] if isinstance(horizons[0], dict) else None
+        if selected is not None:
+            coverage = _as_float_or_none(selected.get("coverage"))
+            horizon = int(selected.get("horizon", coverage_horizon))
+            if coverage is not None and coverage < coverage_threshold:
+                alerts.append(
+                    {
+                        "id": "forecast_coverage_low",
+                        "severity": "warning",
+                        "message": (
+                            f"Forecast coverage {coverage:.4f} is below threshold {coverage_threshold:.4f} "
+                            f"at horizon {horizon} for run {run_id}"
+                        ),
+                        "evidence": {
+                            "run_id": run_id,
+                            "horizon": horizon,
+                            "coverage": coverage,
+                            "threshold": coverage_threshold,
+                        },
+                    }
+                )
+
+    return {
+        "run_id": run_id,
+        "baseline_run_id": baseline_run_id,
+        "rules": rules,
+        "count": len(alerts),
+        "alerts": alerts,
+        **_version_fields(),
+    }
+
+
 @router.get("/ui")
 def ui_page() -> HTMLResponse:
     """Simple demo UI for browsing runs and regime outputs."""
@@ -649,6 +1058,7 @@ def ui_page() -> HTMLResponse:
   <h1>{title}</h1>
   <div id="activeInfo"><strong>Active run:</strong> N/A</div>
   <div id="pinnedInfo"><strong>Pinned run:</strong> none</div>
+  <div id="frozenInfo"><strong>Frozen:</strong> no</div>
   <div id="status">Loading runs...</div>
   <div class="row">
     <label for="runSelect"><strong>Run:</strong></label>
@@ -656,6 +1066,8 @@ def ui_page() -> HTMLResponse:
     <button id="refreshBtn" type="button">Refresh</button>
     <button id="pinBtn" type="button">Pin this run</button>
     <button id="unpinBtn" type="button" style="display:none;">Unpin</button>
+    <button id="bundleBtn" type="button">Download bundle.zip</button>
+    <button id="reportBtn" type="button">View report.md</button>
   </div>
   <div class="box">
     <div id="currentRegime">Current regime: N/A</div>
@@ -664,6 +1076,31 @@ def ui_page() -> HTMLResponse:
   <div class="box">
     <strong>Run summary</strong>
     <pre id="summaryPre">N/A</pre>
+  </div>
+  <div class="box">
+    <strong>Tags</strong>
+    <div class="row">
+      <input id="tagsInput" type="text" placeholder="comma,separated,tags" style="min-width: 280px; padding: 6px 8px;" />
+      <button id="saveTagsBtn" type="button">Save tags</button>
+    </div>
+    <textarea id="notesInput" rows="3" style="width:100%; padding: 6px 8px;" placeholder="optional notes"></textarea>
+  </div>
+  <div class="box">
+    <strong>Run Notes</strong>
+    <div class="row">
+      <button id="saveRunNotesBtn" type="button">Save notes.md</button>
+    </div>
+    <textarea id="runNotesInput" rows="6" style="width:100%; padding: 6px 8px;" placeholder="freeform run notes (notes.md)"></textarea>
+  </div>
+  <div class="box">
+    <strong>Trash</strong>
+    <div class="row">
+      <button id="refreshTrashBtn" type="button">Refresh trash</button>
+      <input id="trashIdInput" type="text" placeholder="trash_id to purge" style="min-width: 280px; padding: 6px 8px;" />
+      <button id="purgeTrashBtn" type="button">Purge trash entry</button>
+    </div>
+    <div id="trashStatus">N/A</div>
+    <pre id="trashPre" style="margin-top:8px; white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;"></pre>
   </div>
   <div class="box">
     <strong>Compare pinned vs latest</strong>
@@ -678,9 +1115,22 @@ def ui_page() -> HTMLResponse:
     const refreshBtn = document.getElementById("refreshBtn");
     const pinBtn = document.getElementById("pinBtn");
     const unpinBtn = document.getElementById("unpinBtn");
+    const bundleBtn = document.getElementById("bundleBtn");
+    const reportBtn = document.getElementById("reportBtn");
+    const tagsInput = document.getElementById("tagsInput");
+    const notesInput = document.getElementById("notesInput");
+    const saveTagsBtn = document.getElementById("saveTagsBtn");
+    const runNotesInput = document.getElementById("runNotesInput");
+    const saveRunNotesBtn = document.getElementById("saveRunNotesBtn");
+    const refreshTrashBtn = document.getElementById("refreshTrashBtn");
+    const trashIdInput = document.getElementById("trashIdInput");
+    const purgeTrashBtn = document.getElementById("purgeTrashBtn");
+    const trashStatus = document.getElementById("trashStatus");
+    const trashPre = document.getElementById("trashPre");
     const statusEl = document.getElementById("status");
     const activeInfoEl = document.getElementById("activeInfo");
     const pinnedInfoEl = document.getElementById("pinnedInfo");
+    const frozenInfoEl = document.getElementById("frozenInfo");
     const currentRegimeEl = document.getElementById("currentRegime");
     const currentMetaEl = document.getElementById("currentMeta");
     const summaryPre = document.getElementById("summaryPre");
@@ -735,6 +1185,27 @@ def ui_page() -> HTMLResponse:
       }}
     }}
 
+    async function loadTrash() {{
+      try {{
+        const payload = await fetchJson("/runs/trash?limit=20");
+        const items = Array.isArray(payload.trash) ? payload.trash : [];
+        if (items.length === 0) {{
+          trashStatus.textContent = "No trash entries";
+          trashPre.textContent = "";
+          return;
+        }}
+        trashStatus.textContent = "Trash entries: " + items.length;
+        const lines = items.map(item => {{
+          const deleted = item.deleted_at_utc || "unknown";
+          const original = item.original_run_id || "unknown";
+          return `${{item.trash_id}} | original=${{original}} | deleted=${{deleted}}`;
+        }});
+        trashPre.textContent = lines.join("\\n");
+      }} catch (err) {{
+        trashStatus.textContent = "Error loading trash: " + err.message;
+      }}
+    }}
+
     function formatSummary(summary) {{
       const start = summary.start_date || "N/A";
       const end = summary.end_date || "N/A";
@@ -750,14 +1221,28 @@ def ui_page() -> HTMLResponse:
     async function loadRun(runId) {{
       statusEl.textContent = "Loading run " + runId + "...";
       try {{
-        const [summary, current] = await Promise.all([
+        const [summary, current, artifacts] = await Promise.all([
           fetchJson("/runs/" + encodeURIComponent(runId) + "/summary"),
           fetchJson("/predict_current?include_probs=true", {{
             method: "POST",
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify({{ run_id: runId }})
-          }})
+          }}),
+          fetchJson("/runs/" + encodeURIComponent(runId) + "/artifacts")
         ]);
+
+        let tagsPayload = null;
+        let runNotesPayload = null;
+        try {{
+          tagsPayload = await fetchJson("/runs/" + encodeURIComponent(runId) + "/tags");
+        }} catch (err) {{
+          tagsPayload = null;
+        }}
+        try {{
+          runNotesPayload = await fetchJson("/runs/" + encodeURIComponent(runId) + "/notes");
+        }} catch (err) {{
+          runNotesPayload = null;
+        }}
 
         summaryPre.textContent = formatSummary(summary);
 
@@ -767,6 +1252,34 @@ def ui_page() -> HTMLResponse:
           ? "N/A"
           : current.p_label.toFixed(4);
         currentMetaEl.textContent = "as_of=" + current.as_of_date + " | p_label=" + pLabel;
+        bundleBtn.onclick = () => {{
+          window.location.href = "/runs/" + encodeURIComponent(runId) + "/bundle.zip";
+        }};
+        reportBtn.onclick = () => {{
+          window.open("/runs/" + encodeURIComponent(runId) + "/report.md", "_blank");
+        }};
+
+        const artifactNames = Array.isArray(artifacts.artifacts) ? artifacts.artifacts : [];
+        if (artifactNames.includes("frozen.json")) {{
+          try {{
+            const frozen = await fetchJson("/runs/" + encodeURIComponent(runId) + "/artifacts/frozen.json");
+            const reason = frozen.reason ? (" (" + frozen.reason + ")") : "";
+            frozenInfoEl.innerHTML = "<strong>Frozen:</strong> yes" + reason;
+          }} catch (err) {{
+            frozenInfoEl.innerHTML = "<strong>Frozen:</strong> yes";
+          }}
+        }} else {{
+          frozenInfoEl.innerHTML = "<strong>Frozen:</strong> no";
+        }}
+
+        if (tagsPayload) {{
+          tagsInput.value = Array.isArray(tagsPayload.tags) ? tagsPayload.tags.join(",") : "";
+          notesInput.value = tagsPayload.notes || "";
+        }} else {{
+          tagsInput.value = "";
+          notesInput.value = "";
+        }}
+        runNotesInput.value = (runNotesPayload && runNotesPayload.content) ? runNotesPayload.content : "";
 
         plotFrame.src = "/runs/" + encodeURIComponent(runId) + "/plot/html";
         statusEl.textContent = "Loaded run " + runId;
@@ -782,6 +1295,7 @@ def ui_page() -> HTMLResponse:
         latestRunId = runs.length > 0 ? runs[0] : null;
         await loadActive();
         await loadPinned();
+        await loadTrash();
         runSelect.innerHTML = "";
         if (runs.length === 0) {{
           statusEl.textContent = "No runs available. Train a model first.";
@@ -835,24 +1349,80 @@ def ui_page() -> HTMLResponse:
         statusEl.textContent = "Error unpinning run: " + err.message;
       }}
     }});
+    saveTagsBtn.addEventListener("click", async () => {{
+      if (!runSelect.value) {{
+        return;
+      }}
+      const runId = runSelect.value;
+      const tags = tagsInput.value
+        .split(",")
+        .map(v => v.trim())
+        .filter(v => v.length > 0);
+      try {{
+        await fetchJson("/runs/" + encodeURIComponent(runId) + "/tags", {{
+          method: "PUT",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ tags: tags, notes: notesInput.value }})
+        }});
+        statusEl.textContent = "Saved tags for " + runId;
+      }} catch (err) {{
+        statusEl.textContent = "Error saving tags: " + err.message;
+      }}
+    }});
+    saveRunNotesBtn.addEventListener("click", async () => {{
+      if (!runSelect.value) {{
+        return;
+      }}
+      const runId = runSelect.value;
+      try {{
+        await fetchJson("/runs/" + encodeURIComponent(runId) + "/notes", {{
+          method: "PUT",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ content: runNotesInput.value }})
+        }});
+        statusEl.textContent = "Saved notes.md for " + runId;
+      }} catch (err) {{
+        statusEl.textContent = "Error saving notes: " + err.message;
+      }}
+    }});
+    refreshTrashBtn.addEventListener("click", loadTrash);
+    purgeTrashBtn.addEventListener("click", async () => {{
+      const trashId = (trashIdInput.value || "").trim();
+      if (!trashId) {{
+        statusEl.textContent = "Enter a trash_id to purge.";
+        return;
+      }}
+      try {{
+        await fetchJson("/runs/trash/" + encodeURIComponent(trashId), {{
+          method: "DELETE"
+        }});
+        statusEl.textContent = "Purged trash entry " + trashId;
+        trashIdInput.value = "";
+        await loadTrash();
+      }} catch (err) {{
+        statusEl.textContent = "Error purging trash: " + err.message;
+      }}
+    }});
     compareBtn.addEventListener("click", async () => {{
       if (!pinnedRunId || !latestRunId || pinnedRunId === latestRunId) {{
         return;
       }}
       try {{
-        const payload = await fetchJson("/runs/compare_pinned_latest", {{
-          method: "POST"
-        }});
-        const diffs = payload.diffs || {{}};
-        const runs = Array.isArray(payload.runs) ? payload.runs : [];
+        const payload = await fetchJson(
+          "/runs/" + encodeURIComponent(pinnedRunId) + "/compare/" + encodeURIComponent(latestRunId)
+        );
+        const diffs = payload.metrics_diff || {{}};
+        const runs = Array.isArray(payload.compare && payload.compare.runs) ? payload.compare.runs : [];
         const first = runs[0] || {{}};
         const second = runs[1] || {{}};
+        const driftDeltas = payload.drift && payload.drift.deltas ? payload.drift.deltas : {{}};
         comparePre.textContent =
           "pinned best_val_ll: " + (first.metrics ? first.metrics.best_val_ll : "N/A") + "\\n" +
           "latest best_val_ll: " + (second.metrics ? second.metrics.best_val_ll : "N/A") + "\\n" +
           "delta_best_val_ll: " + (diffs.delta_best_val_ll ?? "N/A") + "\\n" +
           "delta_transition_entropy: " + (diffs.delta_transition_entropy ?? "N/A") + "\\n" +
-          "delta_shock_occupancy: " + (diffs.delta_shock_occupancy ?? "N/A");
+          "delta_shock_occupancy: " + (diffs.delta_shock_occupancy ?? "N/A") + "\\n" +
+          "occupancy_kl_divergence: " + (driftDeltas.occupancy_kl_divergence ?? "N/A");
       }} catch (err) {{
         comparePre.textContent = "Error comparing runs: " + err.message;
       }}
@@ -949,6 +1519,7 @@ def _predict_current_impl(
             "label_mapping": labels_map,
             "expected_return": expected_return,
             "expected_vol": expected_vol,
+            **_version_fields(),
         }
         if prob_info is not None and state < len(prob_info["raw_state_probs"]):
             payload["p_label"] = float(prob_info["raw_state_probs"][state])
@@ -983,6 +1554,7 @@ def _predict_current_impl(
             "label_mapping": labels_map,
             "expected_return": expected_return,
             "expected_vol": expected_vol,
+            **_version_fields(),
         }
         if include_probs:
             payload["probs"] = prob_info["label_probs"]
@@ -1116,6 +1688,75 @@ def forecast_v2(
     }
 
 
+@router.get("/forecast_v3")
+def forecast_v3(
+    run_id: Optional[str] = Query(default=None),
+    use_pinned: bool = Query(default=False),
+    horizon: int = Query(default=10, ge=1, le=365),
+    interval: float = Query(default=0.95, gt=0.0, lt=1.0),
+) -> dict[str, Any]:
+    """Return additive forecast schema with labeled and raw state moments."""
+    resolved_run_id = _resolve_effective_run_id(run_id=run_id, use_pinned=use_pinned)
+    run_path = _resolve_run_path(resolved_run_id)
+    model_json_path = run_path / "model_params.json"
+    if not model_json_path.exists():
+        raise _artifact_not_found(run_path.name, ["model_params.json"])
+
+    model_params = _load_model_params_cached(model_json_path)
+    probs_payload = _read_json(run_path / "predict_proba.json", run_id=run_path.name)
+    regime_probabilities = np.asarray(probs_payload.get("regime_probabilities", []), dtype=np.float64)
+    dates = probs_payload.get("dates", [])
+    if regime_probabilities.ndim != 2 or regime_probabilities.shape[0] == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_path.name} has malformed artifact: predict_proba.json",
+        )
+    if len(dates) != regime_probabilities.shape[0]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_path.name} has malformed artifact: predict_proba.json",
+        )
+
+    transition_matrix = np.asarray(model_params["transition_matrix"], dtype=np.float64)
+    mu = np.asarray(model_params["mu"], dtype=np.float64)
+    sigma = np.asarray(model_params["sigma"], dtype=np.float64)
+    current = np.asarray(regime_probabilities[-1], dtype=np.float64)
+    labels_map = _with_default_labels(_read_label_mapping(run_path), int(current.shape[0]))
+    z_score = float(NormalDist().inv_cdf((1.0 + interval) / 2.0))
+
+    rows: list[dict[str, Any]] = []
+    for step in range(1, horizon + 1):
+        current = current @ transition_matrix
+        expected_return, expected_vol = probability_weighted_moments(
+            state_probs=current,
+            mu=mu,
+            sigma=sigma,
+        )
+        rows.append(
+            {
+                "horizon": int(step),
+                "probs_by_label": {
+                    labels_map.get(str(i), f"regime_{i}"): float(current[i])
+                    for i in range(current.shape[0])
+                },
+                "raw_state_probs": [float(x) for x in current.tolist()],
+                "expected_return": float(expected_return),
+                "expected_vol": float(expected_vol),
+                "interval_low": float(expected_return - z_score * expected_vol),
+                "interval_high": float(expected_return + z_score * expected_vol),
+            }
+        )
+
+    return {
+        "run_id": run_path.name,
+        "as_of_date": str(dates[-1]),
+        "horizon": int(horizon),
+        "interval": float(interval),
+        "forecast": rows,
+        **_version_fields(),
+    }
+
+
 def _resolve_run_path(run_id: Optional[str]) -> Path:
     try:
         return resolve_run_dir(run_id=run_id, runs_root=RUNS_ROOT)
@@ -1136,6 +1777,18 @@ def _list_run_ids(order: str = "desc") -> list[str]:
     return run_ids
 
 
+def _list_trash_ids(order: str = "desc") -> list[str]:
+    order_lc = order.lower()
+    if order_lc not in {"asc", "desc"}:
+        raise HTTPException(status_code=400, detail=f"Invalid order '{order}'. Use 'asc' or 'desc'.")
+    trash_root = _trash_root()
+    trash_ids = sorted(
+        [p.name for p in trash_root.iterdir() if p.is_dir()],
+        reverse=(order_lc == "desc"),
+    )
+    return trash_ids
+
+
 def _latest_run_id_or_404() -> str:
     run_ids = _list_run_ids()
     if not run_ids:
@@ -1153,6 +1806,64 @@ def _resolve_effective_run_id(run_id: str | None, use_pinned: bool) -> str:
 
 def _pinned_run_file() -> Path:
     return RUNS_ROOT / PINNED_RUN_FILENAME
+
+
+def _latest_run_pointer_file() -> Path:
+    return RUNS_ROOT / "latest_run.txt"
+
+
+def _trash_root() -> Path:
+    trash_root = RUNS_ROOT / TRASH_DIRNAME
+    trash_root.mkdir(parents=True, exist_ok=True)
+    return trash_root
+
+
+def _extract_run_id_from_trash_id(trash_id: str) -> str | None:
+    if "_" not in trash_id:
+        return None
+    run_id = trash_id.rsplit("_", 1)[0]
+    if not run_id.startswith("run_"):
+        return None
+    return run_id
+
+
+def _deleted_at_from_trash_id(trash_id: str) -> str | None:
+    run_id = _extract_run_id_from_trash_id(trash_id)
+    if run_id is None:
+        return None
+    suffix = trash_id[len(run_id) + 1 :]
+    try:
+        parsed = datetime.strptime(suffix, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return parsed.isoformat()
+
+
+def _trash_item_payload(trash_id: str) -> dict[str, Any]:
+    trash_path = _trash_root() / trash_id
+    if not trash_path.exists() or not trash_path.is_dir():
+        raise HTTPException(status_code=404, detail=f"Trash entry not found: {trash_id}")
+    return {
+        "trash_id": trash_id,
+        "original_run_id": _extract_run_id_from_trash_id(trash_id),
+        "deleted_at_utc": _deleted_at_from_trash_id(trash_id),
+        "path": str(trash_path),
+    }
+
+
+def _reconcile_latest_pointer() -> None:
+    latest_file = _latest_run_pointer_file()
+    run_ids = _list_run_ids()
+    if not run_ids:
+        if latest_file.exists():
+            latest_file.unlink()
+        return
+
+    current: str | None = None
+    if latest_file.exists():
+        current = latest_file.read_text(encoding="utf-8").strip() or None
+    if current not in run_ids:
+        latest_file.write_text(run_ids[0], encoding="utf-8")
 
 
 def _validate_run_id_for_pin(run_id: str) -> None:
@@ -1235,6 +1946,36 @@ def _ensure_manifest_has_artifact(run_id: str, run_path: Path, artifact_name: st
         artifacts.append(artifact_name)
     manifest["artifacts"] = artifacts
     write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest)
+    _invalidate_json_cache(run_path / "manifest.json")
+
+
+def _append_run_mutation(
+    run_id: str,
+    run_path: Path,
+    action: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    mutation_path = run_path / "mutations.json"
+    if mutation_path.exists():
+        payload = _read_json(mutation_path, run_id=run_id)
+        mutations = payload.get("mutations", [])
+        if not isinstance(mutations, list):
+            mutations = []
+    else:
+        payload = {"run_id": run_id, "mutations": []}
+        mutations = []
+
+    entry = {
+        "at_utc": datetime.now(timezone.utc).isoformat(),
+        "action": str(action),
+        "details": details or {},
+    }
+    mutations.append(entry)
+    payload["run_id"] = run_id
+    payload["mutations"] = mutations
+    _write_json(mutation_path, payload)
+    _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="mutations.json")
+    return entry
 
 
 def _latest_run_payload(run_id: str, run_path: Path) -> dict[str, Any]:
@@ -1312,6 +2053,110 @@ def _artifact_media_type(name: str) -> str:
     return "application/octet-stream"
 
 
+def _run_integrity_payload(run_id: str, run_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    schema_version = manifest.get("schema_version")
+    artifacts = manifest.get("artifacts", [])
+    expected = manifest.get("artifacts_sha256", {})
+    if schema_version is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has malformed manifest.json: missing schema_version",
+        )
+    if not isinstance(artifacts, list) or not isinstance(expected, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has malformed manifest.json",
+        )
+
+    missing: list[str] = []
+    mismatched: list[dict[str, str]] = []
+    for artifact_name in artifacts:
+        name = str(artifact_name)
+        path = run_path / name
+        if name == "manifest.json":
+            continue
+        if not path.exists() or not path.is_file():
+            missing.append(name)
+            continue
+        expected_hash = expected.get(name)
+        actual_hash = _sha256_file(path)
+        if expected_hash is None:
+            missing.append(name)
+            continue
+        if str(expected_hash) != actual_hash:
+            mismatched.append(
+                {
+                    "name": name,
+                    "expected": str(expected_hash),
+                    "actual": actual_hash,
+                }
+            )
+
+    return {
+        "run_id": run_id,
+        "ok": len(missing) == 0 and len(mismatched) == 0,
+        "missing": missing,
+        "mismatched": mismatched,
+        "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _render_markdown_pre_html(markdown_text: str, run_id: str) -> str:
+    safe_title = html.escape(f"Run Report: {run_id}")
+    safe_body = html.escape(markdown_text)
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" />"
+        f"<title>{safe_title}</title>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+        "<style>body{font-family:ui-monospace,Menlo,monospace;margin:16px;background:#fff;color:#111;}"
+        "pre{white-space:pre-wrap;line-height:1.4;}</style></head><body>"
+        f"<h1>{safe_title}</h1><pre>{safe_body}</pre></body></html>"
+    )
+
+
+def _build_run_info_payload(run_id: str, run_path: Path) -> dict[str, Any]:
+    latest_payload = _latest_run_payload(run_id=run_id, run_path=run_path)
+    return {
+        "run_id": run_id,
+        "run_dir": str(run_path),
+        "api_version": API_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "pinned_run_id": _read_pinned_run_id_or_none(),
+        "created_at_utc": latest_payload.get("created_at_utc"),
+        "end_date": latest_payload.get("end_date"),
+        "last_label": latest_payload.get("last_label"),
+        "last_date": latest_payload.get("last_date"),
+    }
+
+
+def _build_bundle_generated_artifacts(run_id: str, run_path: Path, request: Request) -> dict[str, bytes]:
+    report_path = run_path / "report.md"
+    report_md: str | None = None
+    if report_path.exists():
+        report_md = report_path.read_text(encoding="utf-8")
+    else:
+        try:
+            report_md = _generate_report_markdown(
+                run_id=run_id,
+                run_path=run_path,
+                allow_event_write=False,
+            )
+        except HTTPException:
+            report_md = None
+
+    openapi_payload = request.app.openapi()
+    run_info_payload = _build_run_info_payload(run_id=run_id, run_path=run_path)
+    output = {
+        "openapi.json": json.dumps(openapi_payload, indent=2).encode("utf-8"),
+        "RUN_INFO.json": json.dumps(run_info_payload, indent=2).encode("utf-8"),
+    }
+    if report_md is not None:
+        report_html = _render_markdown_pre_html(report_md, run_id=run_id)
+        output["report.md"] = report_md.encode("utf-8")
+        output["report.html"] = report_html.encode("utf-8")
+    return output
+
+
 def _with_default_labels(labels_map: dict[str, str], n_states: int) -> dict[str, str]:
     out = {str(k): str(v) for k, v in labels_map.items()}
     for idx in range(n_states):
@@ -1323,7 +2168,7 @@ def _load_forecast_model_params(run_path: Path) -> dict[str, np.ndarray]:
     model_json_path = run_path / "model_params.json"
     if model_json_path.exists():
         try:
-            return load_model_params_json(model_json_path)
+            return _load_model_params_cached(model_json_path)
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,
@@ -1347,12 +2192,24 @@ def _load_model_params_or_none(run_id: str, run_path: Path) -> dict[str, np.ndar
     if not model_json_path.exists():
         return None
     try:
-        return load_model_params_json(model_json_path)
+        return _load_model_params_cached(model_json_path)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Run {run_id} has malformed artifact: model_params.json ({exc})",
         ) from exc
+
+
+def _load_model_params_cached(path: Path) -> dict[str, np.ndarray]:
+    cache_key = str(path.resolve())
+    mtime_ns = path.stat().st_mtime_ns
+    cached = _MODEL_PARAMS_CACHE.get(cache_key)
+    if cached is not None and cached[0] == mtime_ns:
+        return {k: np.array(v, copy=True) for k, v in cached[1].items()}
+
+    loaded = load_model_params_json(path)
+    _MODEL_PARAMS_CACHE[cache_key] = (mtime_ns, loaded)
+    return {k: np.array(v, copy=True) for k, v in loaded.items()}
 
 
 def _load_last_prob_info(
@@ -1395,13 +2252,31 @@ def _read_json(path: Path, run_id: str | None = None) -> dict[str, Any]:
         if run_id is not None:
             raise _artifact_not_found(run_id, [path.name])
         raise HTTPException(status_code=404, detail=f"Artifact not found: {path.name}")
+    cache_key = str(path.resolve())
+    use_cache = path.name in _JSON_CACHE_FILENAMES
+    mtime_ns = path.stat().st_mtime_ns
+    if use_cache:
+        cached = _JSON_READ_CACHE.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return copy.deepcopy(cached[1])
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        payload = json.load(f)
+    if use_cache and isinstance(payload, dict):
+        _JSON_READ_CACHE[cache_key] = (mtime_ns, payload)
+        return copy.deepcopy(payload)
+    if isinstance(payload, dict):
+        return payload
+    raise HTTPException(status_code=400, detail=f"Artifact JSON must be an object: {path.name}")
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+    _invalidate_json_cache(path)
+
+
+def _invalidate_json_cache(path: Path) -> None:
+    _JSON_READ_CACHE.pop(str(path.resolve()), None)
 
 
 def _load_or_build_events(run_id: str, run_path: Path, allow_write: bool) -> dict[str, Any]:
@@ -1444,8 +2319,7 @@ def _load_or_build_events(run_id: str, run_path: Path, allow_write: bool) -> dic
         returns=predict.get("returns", []),
         labels_map=labels_map,
     )
-    with events_path.open("w", encoding="utf-8") as f:
-        json.dump(events_payload, f, indent=2)
+    _write_json(events_path, events_payload)
 
     _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="events.json")
 
@@ -1589,9 +2463,17 @@ def _filter_events_payload(
     return out
 
 
-def _build_scorecard_payload(run_id: str, run_path: Path) -> dict[str, Any]:
+def _build_scorecard_payload(
+    run_id: str,
+    run_path: Path,
+    allow_event_write: bool = True,
+) -> dict[str, Any]:
     evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
-    events_payload = _load_or_build_events(run_id=run_id, run_path=run_path, allow_write=True)
+    events_payload = _load_or_build_events(
+        run_id=run_id,
+        run_path=run_path,
+        allow_write=allow_event_write,
+    )
     viterbi = _read_json(run_path / "viterbi_states.json", run_id=run_id)
 
     eval_metrics = evaluation.get("metrics", {})
@@ -1641,6 +2523,7 @@ def _build_scorecard_payload(run_id: str, run_path: Path) -> dict[str, Any]:
 
     return {
         "run_id": run_id,
+        **_version_fields(),
         "metrics": {
             "best_val_log_likelihood": best_val_ll,
             "epochs_ran": int(epochs_ran) if epochs_ran is not None else None,
@@ -1708,6 +2591,251 @@ def _compare_runs_payload(run_ids: list[str]) -> dict[str, Any]:
     return response
 
 
+def _build_drift_payload(
+    run_a: str,
+    run_b: str,
+    run_a_path: Path,
+    run_b_path: Path,
+) -> dict[str, Any]:
+    eval_a = _read_json(run_a_path / "evaluation.json", run_id=run_a)
+    eval_b = _read_json(run_b_path / "evaluation.json", run_id=run_b)
+    summary_a = _read_json(run_a_path / "regime_summary.json", run_id=run_a)
+    summary_b = _read_json(run_b_path / "regime_summary.json", run_id=run_b)
+
+    best_val_a = _as_float_or_none(eval_a.get("metrics", {}).get("best_val_log_likelihood"))
+    best_val_b = _as_float_or_none(eval_b.get("metrics", {}).get("best_val_log_likelihood"))
+    trans_ent_a = _as_float_or_none(eval_a.get("regime_diagnostics", {}).get("transition_entropy"))
+    trans_ent_b = _as_float_or_none(eval_b.get("regime_diagnostics", {}).get("transition_entropy"))
+    shock_occ_a = _shock_occupancy(summary_a)
+    shock_occ_b = _shock_occupancy(summary_b)
+
+    occ_a = _load_occupancies_by_label(run_id=run_a, run_path=run_a_path)
+    occ_b = _load_occupancies_by_label(run_id=run_b, run_path=run_b_path)
+    occupancy_kl = _kl_divergence(occ_a, occ_b)
+
+    event_a = _load_event_classifier_summary(run_id=run_a, run_path=run_a_path, evaluation=eval_a)
+    event_b = _load_event_classifier_summary(run_id=run_b, run_path=run_b_path, evaluation=eval_b)
+    count_delta = _dict_delta_int(event_a.get("event_counts_by_label", {}), event_b.get("event_counts_by_label", {}))
+    duration_delta = _dict_delta_float(
+        event_a.get("avg_event_duration_days_by_label", {}),
+        event_b.get("avg_event_duration_days_by_label", {}),
+    )
+
+    return {
+        "run_a": run_a,
+        "run_b": run_b,
+        "deltas": {
+            "delta_best_val_ll": (
+                None if best_val_a is None or best_val_b is None else float(best_val_b - best_val_a)
+            ),
+            "delta_transition_entropy": (
+                None if trans_ent_a is None or trans_ent_b is None else float(trans_ent_b - trans_ent_a)
+            ),
+            "delta_shock_occupancy": (
+                None if shock_occ_a is None or shock_occ_b is None else float(shock_occ_b - shock_occ_a)
+            ),
+            "occupancy_kl_divergence": occupancy_kl,
+        },
+        "occupancies_by_label": {
+            "run_a": occ_a,
+            "run_b": occ_b,
+        },
+        "event_deltas": {
+            "event_counts_by_label": count_delta,
+            "avg_event_duration_days_by_label": duration_delta,
+        },
+        **_version_fields(),
+    }
+
+
+def _load_occupancies_by_label(run_id: str, run_path: Path) -> dict[str, float]:
+    plot_meta_path = run_path / "plot_meta.json"
+    if plot_meta_path.exists():
+        plot_meta = _read_json(plot_meta_path, run_id=run_id)
+        occ = plot_meta.get("occupancies_by_label", {})
+        if isinstance(occ, dict):
+            return {str(k): float(v) for k, v in occ.items() if _as_float_or_none(v) is not None}
+
+    summary = _read_json(run_path / "regime_summary.json", run_id=run_id)
+    out: dict[str, float] = {}
+    regimes = summary.get("regimes", [])
+    if isinstance(regimes, list):
+        for row in regimes:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("label", f"regime_{row.get('regime', 'x')}"))
+            occ = _as_float_or_none(row.get("avg_posterior_probability"))
+            if occ is not None:
+                out[label] = occ
+    return out
+
+
+def _load_event_classifier_summary(
+    run_id: str,
+    run_path: Path,
+    evaluation: dict[str, Any],
+) -> dict[str, Any]:
+    summary = evaluation.get("event_classifier_summary", {})
+    if isinstance(summary, dict) and summary:
+        return summary
+
+    events_path = run_path / "events.json"
+    if not events_path.exists():
+        return {
+            "event_counts_by_label": {},
+            "avg_event_duration_days_by_label": {},
+        }
+    events_payload = _read_json(events_path, run_id=run_id)
+    events = events_payload.get("events", [])
+    counts: dict[str, int] = {}
+    durations: dict[str, list[float]] = {}
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            label = str(event.get("label", "unknown"))
+            duration = _as_float_or_none(event.get("duration_days", event.get("length")))
+            counts[label] = counts.get(label, 0) + 1
+            if duration is not None:
+                durations.setdefault(label, []).append(duration)
+    avg_durations = {
+        label: float(np.mean(values))
+        for label, values in durations.items()
+        if values
+    }
+    return {
+        "event_counts_by_label": counts,
+        "avg_event_duration_days_by_label": avg_durations,
+    }
+
+
+def _dict_delta_int(a: dict[str, Any], b: dict[str, Any]) -> dict[str, int]:
+    labels = sorted(set(map(str, a.keys())) | set(map(str, b.keys())))
+    out: dict[str, int] = {}
+    for label in labels:
+        out[label] = int(b.get(label, 0)) - int(a.get(label, 0))
+    return out
+
+
+def _dict_delta_float(a: dict[str, Any], b: dict[str, Any]) -> dict[str, float | None]:
+    labels = sorted(set(map(str, a.keys())) | set(map(str, b.keys())))
+    out: dict[str, float | None] = {}
+    for label in labels:
+        va = _as_float_or_none(a.get(label))
+        vb = _as_float_or_none(b.get(label))
+        out[label] = None if va is None or vb is None else float(vb - va)
+    return out
+
+
+def _kl_divergence(p: dict[str, float], q: dict[str, float], eps: float = 1e-8) -> float | None:
+    labels = sorted(set(p.keys()) | set(q.keys()))
+    if not labels:
+        return None
+    p_arr = np.asarray([float(p.get(label, 0.0)) + eps for label in labels], dtype=np.float64)
+    q_arr = np.asarray([float(q.get(label, 0.0)) + eps for label in labels], dtype=np.float64)
+    p_arr = p_arr / np.sum(p_arr)
+    q_arr = q_arr / np.sum(q_arr)
+    return float(np.sum(p_arr * np.log(p_arr / q_arr)))
+
+
+def _report_markdown_response(run_id: str, run_path: Path) -> Response:
+    report_path = run_path / "report.md"
+    if report_path.exists():
+        return Response(content=report_path.read_text(encoding="utf-8"), media_type="text/markdown; charset=utf-8")
+
+    report_content = _generate_report_markdown(
+        run_id=run_id,
+        run_path=run_path,
+        allow_event_write=not _is_run_frozen(run_path),
+    )
+    if not _is_run_frozen(run_path):
+        report_path.write_text(report_content, encoding="utf-8")
+        _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="report.md")
+    return Response(content=report_content, media_type="text/markdown; charset=utf-8")
+
+
+def _generate_report_markdown(
+    run_id: str,
+    run_path: Path,
+    allow_event_write: bool = True,
+) -> str:
+    evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
+    try:
+        scorecard = _build_scorecard_payload(
+            run_id=run_id,
+            run_path=run_path,
+            allow_event_write=allow_event_write,
+        )
+    except HTTPException:
+        scorecard = {
+            "metrics": evaluation.get("metrics", {}),
+            "diagnostics": {
+                "transition_entropy": evaluation.get("regime_diagnostics", {}).get("transition_entropy"),
+                "shock_occupancy": None,
+            },
+            "events_by_label": {},
+            "last_regime": {},
+        }
+    events_payload = _read_json(run_path / "events.json", run_id=run_id) if (run_path / "events.json").exists() else {"events": []}
+    events = events_payload.get("events", [])
+    if not isinstance(events, list):
+        events = []
+    top_events = sorted(
+        [event for event in events if isinstance(event, dict)],
+        key=lambda event: float(event.get("duration_days", event.get("length", 0))),
+        reverse=True,
+    )[:5]
+
+    metrics = scorecard.get("metrics", {})
+    diagnostics = scorecard.get("diagnostics", {})
+    event_counts = scorecard.get("events_by_label", {})
+    best_val = metrics.get("best_val_log_likelihood")
+    transition_entropy = diagnostics.get("transition_entropy")
+    shock_occ = diagnostics.get("shock_occupancy")
+    last_regime = scorecard.get("last_regime", {})
+    event_summary = evaluation.get("event_classifier_summary", {})
+
+    lines: list[str] = [
+        f"# Run Report: {run_id}",
+        "",
+        "## Scorecard",
+        f"- best_val_log_likelihood: {best_val}",
+        f"- epochs_ran: {metrics.get('epochs_ran')}",
+        f"- stopped_early: {metrics.get('stopped_early')}",
+        "",
+        "## Regime Diagnostics",
+        f"- transition_entropy: {transition_entropy}",
+        f"- shock_occupancy: {shock_occ}",
+        f"- last_regime: {last_regime.get('label')} ({last_regime.get('state')}) on {last_regime.get('date')}",
+        "",
+        "## Event Counts",
+    ]
+    for label, count in sorted(event_counts.items()):
+        lines.append(f"- {label}: {count}")
+    lines.extend(
+        [
+            "",
+            "## Top Events",
+        ]
+    )
+    if not top_events:
+        lines.append("- none")
+    else:
+        for event in top_events:
+            lines.append(
+                f"- {event.get('label')} | {event.get('start_date')} -> {event.get('end_date')} | duration={event.get('duration_days', event.get('length'))}"
+            )
+    lines.extend(
+        [
+            "",
+            "## Highlights",
+            f"- event_counts_by_label: {event_summary.get('event_counts_by_label', {})}",
+            f"- avg_event_duration_days_by_label: {event_summary.get('avg_event_duration_days_by_label', {})}",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _events_as_of_date(events: list[dict[str, Any]]) -> datetime:
     max_date: datetime | None = None
     for event in events:
@@ -1719,6 +2847,25 @@ def _events_as_of_date(events: list[dict[str, Any]]) -> datetime:
         if max_date is None or end_dt > max_date:
             max_date = end_dt
     return max_date or datetime.now(timezone.utc)
+
+
+def _version_fields() -> dict[str, Any]:
+    return {
+        "api_version": API_VERSION,
+        "schema_version": SCHEMA_VERSION,
+    }
+
+
+def _require_mutation_auth(request: Request) -> None:
+    expected = os.getenv("REGIME_API_KEY")
+    if not expected:
+        return
+    provided = request.headers.get("X-API-Key")
+    if provided != expected:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid X-API-Key for mutation endpoint",
+        )
 
 
 def _as_float_or_none(value: Any) -> float | None:
