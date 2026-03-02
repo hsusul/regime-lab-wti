@@ -251,6 +251,44 @@ def _build_events_payload(
     return {"run_id": run_id, "n_events": int(len(events)), "events": events}
 
 
+def _event_classifier_summary(events_payload: dict[str, Any]) -> dict[str, Any]:
+    events = events_payload.get("events", [])
+    if not isinstance(events, list):
+        events = []
+
+    counts: dict[str, int] = {}
+    duration_accumulator: dict[str, list[float]] = {}
+    longest: list[dict[str, Any]] = []
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        label = str(event.get("label", "unknown"))
+        duration = float(event.get("duration_days", event.get("length", 0)))
+        counts[label] = counts.get(label, 0) + 1
+        duration_accumulator.setdefault(label, []).append(duration)
+        longest.append(
+            {
+                "label": label,
+                "start_date": event.get("start_date"),
+                "end_date": event.get("end_date"),
+                "duration_days": duration,
+            }
+        )
+
+    avg_duration: dict[str, float] = {}
+    for label, durations in duration_accumulator.items():
+        avg_duration[label] = float(np.mean(np.asarray(durations, dtype=np.float64)))
+
+    longest_sorted = sorted(longest, key=lambda row: float(row.get("duration_days", 0.0)), reverse=True)
+
+    return {
+        "event_counts_by_label": counts,
+        "avg_event_duration_days_by_label": avg_duration,
+        "top_5_longest_events": longest_sorted[:5],
+    }
+
+
 def resolve_run_dir(run_id: Optional[str], runs_root: str | Path = "runs") -> Path:
     root = Path(runs_root)
     if run_id:
@@ -463,6 +501,7 @@ def train_model_run(
             "regimes": regime_diagnostics,
             "viterbi_segment_stats": _viterbi_segment_stats(viterbi_states),
         },
+        "event_classifier_summary": _event_classifier_summary(events_payload),
     }
 
     config_payload = {

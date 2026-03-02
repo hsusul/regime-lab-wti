@@ -158,6 +158,7 @@ def build_figure(
     returns: np.ndarray,
     regime_probabilities: np.ndarray,
     labels_mapping: dict[str, str],
+    occupancies_by_label: dict[str, float],
     viterbi_states: np.ndarray | None = None,
 ) -> go.Figure:
     x = pd.to_datetime(dates)
@@ -175,14 +176,15 @@ def build_figure(
     regime_source = "Viterbi" if viterbi_states is not None else "Filtering argmax"
 
     fig = make_subplots(
-        rows=2,
+        rows=3,
         cols=1,
         shared_xaxes=True,
-        row_heights=[0.62, 0.38],
+        row_heights=[0.54, 0.33, 0.13],
         vertical_spacing=0.08,
         subplot_titles=(
             f"{run_id} | {date_range} | as_of {as_of_date} | Cumulative Return Index with {regime_source} Regime Shading",
             "Filtering Regime Probabilities",
+            "Regime Occupancy",
         ),
     )
 
@@ -234,6 +236,20 @@ def build_figure(
 
     fig.update_yaxes(title_text="Index (start ~100)", row=1, col=1)
     fig.update_yaxes(title_text="Probability", range=[0.0, 1.0], row=2, col=1)
+    if occupancies_by_label:
+        labels = list(occupancies_by_label.keys())
+        values = [float(occupancies_by_label[label]) for label in labels]
+        fig.add_trace(
+            go.Bar(
+                x=labels,
+                y=values,
+                marker={"color": [LINE_COLORS[i % len(LINE_COLORS)] for i in range(len(labels))]},
+                name="Occupancy",
+            ),
+            row=3,
+            col=1,
+        )
+    fig.update_yaxes(title_text="Share", range=[0.0, 1.0], row=3, col=1)
     fig.update_xaxes(title_text="Date", row=2, col=1)
     fig.update_layout(
         template="plotly_white",
@@ -249,6 +265,7 @@ def build_plot_meta(
     summary: dict[str, Any],
     manifest: dict[str, Any] | None,
     labels_mapping: dict[str, str],
+    occupancies_by_label: dict[str, float],
     last_state: int,
     last_date: str,
     n_obs: int,
@@ -266,9 +283,29 @@ def build_plot_meta(
         "end_date": summary.get("end_date"),
         "n_observations": int(summary.get("n_observations", n_obs)),
         "labels": labels,
+        "occupancies_by_label": occupancies_by_label,
         "last_label": labels_mapping.get(str(last_state), f"regime_{last_state}"),
         "last_date": last_date,
     }
+
+
+def _occupancies_by_label(summary: dict[str, Any], labels_mapping: dict[str, str]) -> dict[str, float]:
+    occupancies: dict[str, float] = {}
+    regimes = summary.get("regimes", [])
+    if not isinstance(regimes, list):
+        regimes = []
+    for regime in regimes:
+        if not isinstance(regime, dict):
+            continue
+        regime_idx = int(regime.get("regime", -1))
+        if regime_idx < 0:
+            continue
+        label = labels_mapping.get(str(regime_idx), f"regime_{regime_idx}")
+        occ = regime.get("avg_posterior_probability")
+        if occ is None:
+            continue
+        occupancies[label] = float(occ)
+    return occupancies
 
 
 def main() -> None:
@@ -303,6 +340,7 @@ def main() -> None:
         raise ValueError("dates and returns length mismatch.")
 
     labels_mapping = load_labels_mapping(run_dir=run_dir, n_states=regime_probabilities.shape[1])
+    occupancies_by_label = _occupancies_by_label(summary=summary, labels_mapping=labels_mapping)
     viterbi_states = load_viterbi_states(run_dir=run_dir, n_obs=returns.shape[0])
     start_date = summary.get("start_date") if isinstance(summary, dict) else None
     end_date = summary.get("end_date") if isinstance(summary, dict) else None
@@ -324,6 +362,7 @@ def main() -> None:
         returns=returns,
         regime_probabilities=regime_probabilities,
         labels_mapping=labels_mapping,
+        occupancies_by_label=occupancies_by_label,
         viterbi_states=viterbi_states,
     )
 
@@ -335,6 +374,7 @@ def main() -> None:
         summary=summary,
         manifest=manifest,
         labels_mapping=labels_mapping,
+        occupancies_by_label=occupancies_by_label,
         last_state=last_state,
         last_date=as_of_date,
         n_obs=int(returns.shape[0]),

@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import io
 import html
 import json
+import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Query, Response
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from models.infer import (
     forecast_predictive_distribution,
     load_model_params_json,
     probability_weighted_moments,
 )
+from models.provenance import sha256_file as _sha256_file
 from models.provenance import write_manifest_with_provenance
 from models.train import resolve_run_dir, train_model_run
 
@@ -45,6 +49,120 @@ class CompareRunsRequest(BaseModel):
     run_ids: list[str] = Field(default_factory=list)
 
 
+class RunTagsRequest(BaseModel):
+    """Request payload for run tags metadata."""
+
+    tags: list[str] = Field(default_factory=list)
+    notes: str | None = Field(default=None)
+
+
+class FreezeRunRequest(BaseModel):
+    """Request payload for freezing a run."""
+
+    reason: str | None = Field(default=None)
+
+
+class TransitionAlertRequest(BaseModel):
+    """Request payload for transition alert query."""
+
+    run_id: str | None = Field(default=None)
+    use_pinned: bool = Field(default=False)
+    from_label: str | None = Field(default=None)
+    to_label: str | None = Field(default=None)
+    lookback_days: int = Field(default=30, ge=1, le=3650)
+
+
+class EventSegmentResponse(BaseModel):
+    """Response model for a contiguous Viterbi event segment."""
+
+    model_config = ConfigDict(extra="allow")
+
+    segment_index: int | None = None
+    state: int
+    label: str
+    start_idx: int | None = None
+    end_idx: int | None = None
+    start_date: str
+    end_date: str
+    length: int | None = None
+    duration_days: int | None = None
+    cumulative_log_return: float | None = None
+    mean_return: float | None = None
+    realized_vol: float | None = None
+
+
+class EventsResponseModel(BaseModel):
+    """Response model for events endpoint."""
+
+    model_config = ConfigDict(extra="allow")
+
+    run_id: str
+    n_events: int
+    events: list[EventSegmentResponse]
+
+
+class ScorecardResponseModel(BaseModel):
+    """Response model for scorecard endpoint."""
+
+    model_config = ConfigDict(extra="allow")
+
+    run_id: str
+    metrics: dict[str, Any]
+    diagnostics: dict[str, Any]
+    events_by_label: dict[str, int]
+    last_regime: dict[str, Any]
+
+
+class PredictCurrentResponseModel(BaseModel):
+    """Response model for predict_current endpoint."""
+
+    model_config = ConfigDict(extra="allow")
+
+    run_id: str
+    as_of_date: str
+    state: int
+    label: str
+    p_label: float | None
+    source: str
+    label_mapping: dict[str, str]
+
+
+PREDICT_CURRENT_EXAMPLE = {
+    "run_id": "run_20260301T120000Z_abcd1234",
+    "as_of_date": "2026-03-01",
+    "as_of": "2026-03-01",
+    "state": 2,
+    "label": "shock",
+    "p_label": 0.72,
+    "source": "viterbi",
+    "label_mapping": {"0": "low_vol", "1": "mid_vol", "2": "shock"},
+    "expected_return": -0.0085,
+    "expected_vol": 0.032,
+}
+
+FORECAST_V2_EXAMPLE = {
+    "run_id": "run_20260301T120000Z_abcd1234",
+    "as_of_date": "2026-03-01",
+    "horizon": 2,
+    "forecast": [
+        {
+            "horizon": 1,
+            "state_probs": {"low_vol": 0.62, "mid_vol": 0.28, "shock": 0.10},
+            "expected_return": 0.0003,
+            "expected_vol": 0.014,
+            "expected_price_index": 1.0003,
+        },
+        {
+            "horizon": 2,
+            "state_probs": {"low_vol": 0.59, "mid_vol": 0.30, "shock": 0.11},
+            "expected_return": 0.0002,
+            "expected_vol": 0.0142,
+            "expected_price_index": 1.0005,
+        },
+    ],
+}
+
+
 @router.post("/fit")
 def fit_model(request: FitRequest) -> dict[str, Any]:
     """Train model and persist artifacts under runs/<run_id>/."""
@@ -64,9 +182,20 @@ def fit_model(request: FitRequest) -> dict[str, Any]:
 
 
 @router.get("/runs")
-def list_runs() -> dict[str, Any]:
-    """List available run directories under runs/ sorted newest-first."""
-    return {"runs": _list_run_ids()}
+def list_runs(
+    request: Request,
+    limit: int = Query(default=25, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    order: str = Query(default="desc"),
+) -> dict[str, Any]:
+    """List available run directories under runs/ with pagination and ordering."""
+    run_ids = _list_run_ids(order=order)
+    start = min(offset, len(run_ids))
+    if "limit" in request.query_params:
+        end = min(start + limit, len(run_ids))
+    else:
+        end = len(run_ids)
+    return {"runs": run_ids[start:end]}
 
 
 @router.get("/runs/active")
@@ -131,7 +260,7 @@ def latest_run_evaluation() -> dict[str, Any]:
     return _read_json(run_path / "evaluation.json", run_id=run_id)
 
 
-@router.get("/runs/latest/scorecard")
+@router.get("/runs/latest/scorecard", response_model=ScorecardResponseModel)
 def latest_run_scorecard() -> dict[str, Any]:
     """Return compact scorecard for latest run."""
     run_id = _latest_run_id_or_404()
@@ -139,7 +268,7 @@ def latest_run_scorecard() -> dict[str, Any]:
     return _build_scorecard_payload(run_id=run_id, run_path=run_path)
 
 
-@router.get("/runs/latest/events")
+@router.get("/runs/latest/events", response_model=EventsResponseModel)
 def latest_run_events(
     label: Optional[str] = Query(default=None),
     min_duration_days: Optional[int] = Query(default=None, ge=1),
@@ -147,7 +276,7 @@ def latest_run_events(
     """Return regime events for latest run."""
     run_id = _latest_run_id_or_404()
     run_path = _resolve_run_path(run_id)
-    payload = _load_or_build_events(run_path=run_path)
+    payload = _load_or_build_events(run_id=run_id, run_path=run_path, allow_write=True)
     return _filter_events_payload(payload, label=label, min_duration_days=min_duration_days)
 
 
@@ -160,6 +289,7 @@ def latest_run_plot_path() -> dict[str, str]:
     if not plot_path.exists():
         raise _artifact_not_found(run_id, [plot_path.name])
     return {"run_id": run_id, "plot_path": str(plot_path)}
+
 
 
 @router.get("/runs/{run_id}/summary")
@@ -176,14 +306,14 @@ def run_evaluation(run_id: str) -> dict[str, Any]:
     return _read_json(run_path / "evaluation.json", run_id=run_id)
 
 
-@router.get("/runs/{run_id}/scorecard")
+@router.get("/runs/{run_id}/scorecard", response_model=ScorecardResponseModel)
 def run_scorecard(run_id: str) -> dict[str, Any]:
     """Return compact scorecard for a run."""
     run_path = _resolve_run_path(run_id)
     return _build_scorecard_payload(run_id=run_id, run_path=run_path)
 
 
-@router.get("/runs/{run_id}/events")
+@router.get("/runs/{run_id}/events", response_model=EventsResponseModel)
 def run_events(
     run_id: str,
     label: Optional[str] = Query(default=None),
@@ -191,7 +321,7 @@ def run_events(
 ) -> dict[str, Any]:
     """Return regime events artifact for a run."""
     run_path = _resolve_run_path(run_id)
-    payload = _load_or_build_events(run_path=run_path)
+    payload = _load_or_build_events(run_id=run_id, run_path=run_path, allow_write=True)
     return _filter_events_payload(payload, label=label, min_duration_days=min_duration_days)
 
 
@@ -227,6 +357,8 @@ def run_artifacts(run_id: str) -> dict[str, Any]:
 @router.get("/runs/{run_id}/artifacts/{name}")
 def download_run_artifact(run_id: str, name: str) -> Response:
     """Download a run artifact as raw bytes with content-type."""
+    if Path(name).name != name:
+        raise HTTPException(status_code=400, detail=f"Invalid artifact name for run {run_id}: {name}")
     run_path = _resolve_run_path(run_id)
     artifact_path = run_path / name
     if not artifact_path.exists() or not artifact_path.is_file():
@@ -235,6 +367,172 @@ def download_run_artifact(run_id: str, name: str) -> Response:
             detail=f"Run {run_id} missing artifact: {name}",
         )
     return Response(content=artifact_path.read_bytes(), media_type=_artifact_media_type(name))
+
+
+@router.get("/runs/{run_id}/bundle.zip")
+def download_run_bundle(
+    run_id: str,
+    artifacts: str | None = Query(default=None),
+) -> StreamingResponse:
+    """Download selected run artifacts as a zip bundle."""
+    run_path = _resolve_run_path(run_id)
+    if artifacts is None:
+        manifest = _read_json(run_path / "manifest.json", run_id=run_id)
+        names_raw = manifest.get("artifacts", [])
+        if not isinstance(names_raw, list):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Run {run_id} has malformed artifact: manifest.json",
+            )
+        artifact_names = [str(name) for name in names_raw]
+    else:
+        artifact_names = [name.strip() for name in artifacts.split(",") if name.strip()]
+
+    if not artifact_names:
+        raise HTTPException(status_code=400, detail=f"Run {run_id} has no artifacts to bundle")
+    for name in artifact_names:
+        if Path(name).name != name:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Run {run_id} has invalid artifact name in request: {name}",
+            )
+
+    missing = [name for name in artifact_names if not (run_path / name).exists()]
+    if missing:
+        raise _artifact_not_found(run_id, missing)
+
+    total_bytes = 0
+    for name in artifact_names:
+        path = run_path / name
+        if path.is_file():
+            total_bytes += path.stat().st_size
+    max_bytes = 25 * 1024 * 1024
+    if total_bytes > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Run {run_id} bundle exceeds 25MB limit ({total_bytes} bytes)",
+        )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name in artifact_names:
+            path = run_path / name
+            if path.is_file():
+                zf.writestr(name, path.read_bytes())
+    buf.seek(0)
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{run_id}_bundle.zip"',
+    }
+    return StreamingResponse(buf, media_type="application/zip", headers=headers)
+
+
+@router.get("/runs/{run_id}/tags")
+def get_run_tags(run_id: str) -> dict[str, Any]:
+    """Return tags metadata for a run."""
+    run_path = _resolve_run_path(run_id)
+    return _read_json(run_path / "tags.json", run_id=run_id)
+
+
+@router.put("/runs/{run_id}/tags")
+def put_run_tags(run_id: str, request: RunTagsRequest) -> dict[str, Any]:
+    """Create or update tags metadata for a run and stamp manifest provenance."""
+    run_path = _resolve_run_path(run_id)
+    _assert_run_not_frozen(run_id=run_id, run_path=run_path, action="update tags")
+    tags = sorted({str(tag).strip() for tag in request.tags if str(tag).strip()})
+    payload = {
+        "tags": tags,
+        "notes": request.notes,
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(run_path / "tags.json", payload)
+    _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="tags.json")
+    return payload
+
+
+@router.post("/runs/{run_id}/freeze")
+def freeze_run(run_id: str, request: FreezeRunRequest | None = None) -> dict[str, Any]:
+    """Freeze a run to prevent mutating artifacts inside run dir."""
+    run_path = _resolve_run_path(run_id)
+    reason = request.reason if request is not None else None
+    payload = {
+        "frozen": True,
+        "reason": reason,
+        "at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(run_path / "frozen.json", payload)
+    _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="frozen.json")
+    return {"run_id": run_id, **payload}
+
+
+@router.post("/runs/{run_id}/unfreeze")
+def unfreeze_run(run_id: str) -> dict[str, Any]:
+    """Unfreeze a run by deleting frozen.json when present."""
+    run_path = _resolve_run_path(run_id)
+    frozen_path = run_path / "frozen.json"
+    if not frozen_path.exists():
+        return {"run_id": run_id, "unfrozen": False}
+    frozen_path.unlink()
+    manifest_path = run_path / "manifest.json"
+    if manifest_path.exists():
+        manifest = _read_json(manifest_path, run_id=run_id)
+        artifacts = manifest.get("artifacts", [])
+        if isinstance(artifacts, list) and "frozen.json" in artifacts:
+            manifest["artifacts"] = [name for name in artifacts if name != "frozen.json"]
+            write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest)
+    return {"run_id": run_id, "unfrozen": True}
+
+
+@router.get("/runs/{run_id}/integrity")
+def run_integrity(run_id: str) -> dict[str, Any]:
+    """Verify manifest artifact hashes against files on disk."""
+    run_path = _resolve_run_path(run_id)
+    manifest = _read_json(run_path / "manifest.json", run_id=run_id)
+    schema_version = manifest.get("schema_version")
+    artifacts = manifest.get("artifacts", [])
+    expected = manifest.get("artifacts_sha256", {})
+    if schema_version is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has malformed manifest.json: missing schema_version",
+        )
+    if not isinstance(artifacts, list) or not isinstance(expected, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has malformed manifest.json",
+        )
+
+    missing: list[str] = []
+    mismatched: list[dict[str, str]] = []
+    for artifact_name in artifacts:
+        name = str(artifact_name)
+        path = run_path / name
+        if name == "manifest.json":
+            continue
+        if not path.exists() or not path.is_file():
+            missing.append(name)
+            continue
+        expected_hash = expected.get(name)
+        actual_hash = _sha256_file(path)
+        if expected_hash is None:
+            missing.append(name)
+            continue
+        if str(expected_hash) != actual_hash:
+            mismatched.append(
+                {
+                    "name": name,
+                    "expected": str(expected_hash),
+                    "actual": actual_hash,
+                }
+            )
+
+    return {
+        "run_id": run_id,
+        "ok": len(missing) == 0 and len(mismatched) == 0,
+        "missing": missing,
+        "mismatched": mismatched,
+        "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.get("/runs/{run_id}/manifest")
@@ -254,61 +552,75 @@ def run_model(run_id: str) -> dict[str, Any]:
 @router.post("/runs/compare")
 def compare_runs(request: CompareRunsRequest) -> dict[str, Any]:
     """Compare run artifacts using persisted summary/evaluation data."""
-    run_ids = request.run_ids
-    if not run_ids:
+    if not request.run_ids:
         raise HTTPException(status_code=400, detail="run_ids must contain at least one run id")
+    return _compare_runs_payload(request.run_ids)
 
-    rows: list[dict[str, Any]] = []
-    for run_id in run_ids:
-        run_path = _resolve_run_path(run_id)
-        evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
-        summary = _read_json(run_path / "regime_summary.json", run_id=run_id)
-        transition = _read_json(run_path / "transition_matrix.json", run_id=run_id)
 
-        metrics = evaluation.get("metrics", {})
-        rows.append(
+@router.post("/runs/compare_pinned_latest")
+def compare_pinned_latest() -> dict[str, Any]:
+    """Convenience compare for [pinned, latest] run ids."""
+    pinned = _read_pinned_run_id_or_404()
+    latest = _latest_run_id_or_404()
+    payload = _compare_runs_payload([pinned, latest])
+    payload["pinned_run_id"] = pinned
+    payload["latest_run_id"] = latest
+    return payload
+
+
+@router.post("/alerts/transition")
+def transition_alerts(request: TransitionAlertRequest) -> dict[str, Any]:
+    """Return recent regime transitions filtered by labels and lookback."""
+    run_id = _resolve_effective_run_id(run_id=request.run_id, use_pinned=request.use_pinned)
+    run_path = _resolve_run_path(run_id)
+    events_payload = _load_or_build_events(run_id=run_id, run_path=run_path, allow_write=True)
+    events = events_payload.get("events", [])
+    if not isinstance(events, list):
+        events = []
+
+    as_of = _events_as_of_date(events)
+    cutoff = as_of - timedelta(days=int(request.lookback_days))
+    transitions: list[dict[str, Any]] = []
+    for idx in range(1, len(events)):
+        prev = events[idx - 1]
+        current = events[idx]
+        if not isinstance(prev, dict) or not isinstance(current, dict):
+            continue
+        from_label = str(prev.get("label", "unknown"))
+        to_label = str(current.get("label", "unknown"))
+        if request.from_label is not None and from_label != request.from_label:
+            continue
+        if request.to_label is not None and to_label != request.to_label:
+            continue
+
+        transition_date_raw = current.get("start_date")
+        try:
+            transition_date = datetime.strptime(str(transition_date_raw), "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        if transition_date < cutoff:
+            continue
+        transitions.append(
             {
-                "run_id": run_id,
-                "metrics": {
-                    "best_val_ll": metrics.get("best_val_log_likelihood"),
-                    "test_avg_ll": metrics.get("test_avg_log_likelihood"),
-                },
-                "evaluation": evaluation,
-                "summary": summary,
-                "transition": transition,
+                "from_label": from_label,
+                "to_label": to_label,
+                "from_state": int(prev.get("state", -1)),
+                "to_state": int(current.get("state", -1)),
+                "date": str(transition_date_raw),
+                "from_segment": int(prev.get("segment_index", idx - 1)),
+                "to_segment": int(current.get("segment_index", idx)),
             }
         )
 
-    response: dict[str, Any] = {"runs": rows}
-    if len(rows) == 2:
-        first = rows[0]
-        second = rows[1]
-        first_best = _as_float_or_none(first["metrics"].get("best_val_ll"))
-        second_best = _as_float_or_none(second["metrics"].get("best_val_ll"))
-
-        first_ent = _as_float_or_none(
-            first["evaluation"].get("regime_diagnostics", {}).get("transition_entropy")
-        )
-        second_ent = _as_float_or_none(
-            second["evaluation"].get("regime_diagnostics", {}).get("transition_entropy")
-        )
-
-        first_shock = _shock_occupancy(first["summary"])
-        second_shock = _shock_occupancy(second["summary"])
-
-        response["diffs"] = {
-            "delta_best_val_ll": (
-                None if first_best is None or second_best is None else float(second_best - first_best)
-            ),
-            "delta_transition_entropy": (
-                None if first_ent is None or second_ent is None else float(second_ent - first_ent)
-            ),
-            "delta_shock_occupancy": (
-                None if first_shock is None or second_shock is None else float(second_shock - first_shock)
-            ),
-        }
-
-    return response
+    return {
+        "run_id": run_id,
+        "lookback_days": int(request.lookback_days),
+        "count": int(len(transitions)),
+        "last_transition": transitions[-1] if transitions else None,
+        "transitions": transitions,
+    }
 
 
 @router.get("/ui")
@@ -528,10 +840,8 @@ def ui_page() -> HTMLResponse:
         return;
       }}
       try {{
-        const payload = await fetchJson("/runs/compare", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{ run_ids: [pinnedRunId, latestRunId] }})
+        const payload = await fetchJson("/runs/compare_pinned_latest", {{
+          method: "POST"
         }});
         const diffs = payload.diffs || {{}};
         const runs = Array.isArray(payload.runs) ? payload.runs : [];
@@ -555,7 +865,15 @@ def ui_page() -> HTMLResponse:
     return HTMLResponse(content=html_body)
 
 
-@router.post("/predict_current")
+@router.post(
+    "/predict_current",
+    response_model=PredictCurrentResponseModel,
+    responses={
+        200: {
+            "content": {"application/json": {"example": PREDICT_CURRENT_EXAMPLE}},
+        }
+    },
+)
 def predict_current_with_options(
     request: Optional[PredictCurrentRequest] = None,
     include_probs: bool = Query(default=False),
@@ -726,7 +1044,14 @@ def forecast(
     return payload
 
 
-@router.get("/forecast_v2")
+@router.get(
+    "/forecast_v2",
+    responses={
+        200: {
+            "content": {"application/json": {"example": FORECAST_V2_EXAMPLE}},
+        }
+    },
+)
 def forecast_v2(
     run_id: Optional[str] = Query(default=None),
     use_pinned: bool = Query(default=False),
@@ -798,13 +1123,17 @@ def _resolve_run_path(run_id: Optional[str]) -> Path:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-def _list_run_ids() -> list[str]:
+def _list_run_ids(order: str = "desc") -> list[str]:
+    order_lc = order.lower()
+    if order_lc not in {"asc", "desc"}:
+        raise HTTPException(status_code=400, detail=f"Invalid order '{order}'. Use 'asc' or 'desc'.")
     if not RUNS_ROOT.exists():
         return []
-    return sorted(
+    run_ids = sorted(
         [p.name for p in RUNS_ROOT.iterdir() if p.is_dir() and p.name.startswith("run_")],
-        reverse=True,
+        reverse=(order_lc == "desc"),
     )
+    return run_ids
 
 
 def _latest_run_id_or_404() -> str:
@@ -867,6 +1196,45 @@ def _read_pinned_run_id_or_none() -> str | None:
     if not run_path.exists() or not run_path.is_dir():
         return None
     return pinned_run_id
+
+
+def _is_run_frozen(run_path: Path) -> bool:
+    frozen_path = run_path / "frozen.json"
+    if not frozen_path.exists():
+        return False
+    try:
+        payload = _read_json(frozen_path, run_id=run_path.name)
+    except HTTPException:
+        return False
+    return bool(payload.get("frozen", True))
+
+
+def _assert_run_not_frozen(run_id: str, run_path: Path, action: str) -> None:
+    if _is_run_frozen(run_path):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run {run_id} is frozen; cannot {action}.",
+        )
+
+
+def _ensure_manifest_has_artifact(run_id: str, run_path: Path, artifact_name: str) -> None:
+    manifest_path = run_path / "manifest.json"
+    manifest: dict[str, Any]
+    if manifest_path.exists():
+        manifest = _read_json(manifest_path, run_id=run_id)
+    else:
+        manifest = {
+            "run_id": run_id,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "artifacts": [],
+        }
+    artifacts = manifest.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        artifacts = []
+    if artifact_name not in artifacts:
+        artifacts.append(artifact_name)
+    manifest["artifacts"] = artifacts
+    write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest)
 
 
 def _latest_run_payload(run_id: str, run_path: Path) -> dict[str, Any]:
@@ -1031,13 +1399,29 @@ def _read_json(path: Path, run_id: str | None = None) -> dict[str, Any]:
         return json.load(f)
 
 
-def _load_or_build_events(run_path: Path) -> dict[str, Any]:
-    run_id = run_path.name
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _load_or_build_events(run_id: str, run_path: Path, allow_write: bool) -> dict[str, Any]:
     events_path = run_path / "events.json"
+    needs_write = False
     if events_path.exists():
         existing = _read_json(events_path, run_id=run_id)
         if _events_payload_is_enriched(existing):
             return existing
+        needs_write = True
+    else:
+        needs_write = True
+
+    if needs_write and not allow_write:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run {run_id} requires events enrichment but writes are disabled",
+        )
+    if needs_write:
+        _assert_run_not_frozen(run_id=run_id, run_path=run_path, action="enrich events artifact")
 
     missing: list[str] = []
     viterbi_path = run_path / "viterbi_states.json"
@@ -1063,14 +1447,7 @@ def _load_or_build_events(run_path: Path) -> dict[str, Any]:
     with events_path.open("w", encoding="utf-8") as f:
         json.dump(events_payload, f, indent=2)
 
-    manifest_path = run_path / "manifest.json"
-    if manifest_path.exists():
-        manifest = _read_json(manifest_path, run_id=run_id)
-        artifacts = manifest.get("artifacts", [])
-        if isinstance(artifacts, list) and "events.json" not in artifacts:
-            artifacts.append("events.json")
-            manifest["artifacts"] = artifacts
-        write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest)
+    _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="events.json")
 
     return events_payload
 
@@ -1214,7 +1591,7 @@ def _filter_events_payload(
 
 def _build_scorecard_payload(run_id: str, run_path: Path) -> dict[str, Any]:
     evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
-    events_payload = _load_or_build_events(run_path=run_path)
+    events_payload = _load_or_build_events(run_id=run_id, run_path=run_path, allow_write=True)
     viterbi = _read_json(run_path / "viterbi_states.json", run_id=run_id)
 
     eval_metrics = evaluation.get("metrics", {})
@@ -1280,6 +1657,68 @@ def _build_scorecard_payload(run_id: str, run_path: Path) -> dict[str, Any]:
             "date": str(dates[-1]),
         },
     }
+
+
+def _compare_runs_payload(run_ids: list[str]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        run_path = _resolve_run_path(run_id)
+        evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
+        summary = _read_json(run_path / "regime_summary.json", run_id=run_id)
+        transition = _read_json(run_path / "transition_matrix.json", run_id=run_id)
+        metrics = evaluation.get("metrics", {})
+        rows.append(
+            {
+                "run_id": run_id,
+                "metrics": {
+                    "best_val_ll": metrics.get("best_val_log_likelihood"),
+                    "test_avg_ll": metrics.get("test_avg_log_likelihood"),
+                },
+                "evaluation": evaluation,
+                "summary": summary,
+                "transition": transition,
+            }
+        )
+
+    response: dict[str, Any] = {"runs": rows}
+    if len(rows) == 2:
+        first = rows[0]
+        second = rows[1]
+        first_best = _as_float_or_none(first["metrics"].get("best_val_ll"))
+        second_best = _as_float_or_none(second["metrics"].get("best_val_ll"))
+        first_ent = _as_float_or_none(
+            first["evaluation"].get("regime_diagnostics", {}).get("transition_entropy")
+        )
+        second_ent = _as_float_or_none(
+            second["evaluation"].get("regime_diagnostics", {}).get("transition_entropy")
+        )
+        first_shock = _shock_occupancy(first["summary"])
+        second_shock = _shock_occupancy(second["summary"])
+        response["diffs"] = {
+            "delta_best_val_ll": (
+                None if first_best is None or second_best is None else float(second_best - first_best)
+            ),
+            "delta_transition_entropy": (
+                None if first_ent is None or second_ent is None else float(second_ent - first_ent)
+            ),
+            "delta_shock_occupancy": (
+                None if first_shock is None or second_shock is None else float(second_shock - first_shock)
+            ),
+        }
+    return response
+
+
+def _events_as_of_date(events: list[dict[str, Any]]) -> datetime:
+    max_date: datetime | None = None
+    for event in events:
+        end_date_raw = event.get("end_date")
+        try:
+            end_dt = datetime.strptime(str(end_date_raw), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if max_date is None or end_dt > max_date:
+            max_date = end_dt
+    return max_date or datetime.now(timezone.utc)
 
 
 def _as_float_or_none(value: Any) -> float | None:

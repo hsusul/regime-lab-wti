@@ -116,6 +116,8 @@ By default, the HTML is saved to `runs/<run_id>/regimes.html`.
 - `GET /runs/latest/summary` -> latest run summary
 - `GET /runs/{run_id}/artifacts/{name}` -> download raw artifact bytes
 - `GET /runs/{run_id}/scorecard` -> compact run quality/diagnostics summary
+- `GET /runs/{run_id}/integrity` -> verify artifact hashes from manifest
+- `GET /runs/{run_id}/bundle.zip` -> download selected/all run artifacts as zip
 - `GET /predict_proba` -> dates, returns, per-regime probabilities
 - `GET /transition_matrix` -> learned transition matrix
 - `GET /regime_summary` -> regime stats, durations, transition counts
@@ -159,6 +161,32 @@ make ui
 ```
 
 Open [http://localhost:8000/ui](http://localhost:8000/ui).
+
+## Run Management
+
+- Pin/unpin active run:
+  - `POST /runs/{run_id}/pin`
+  - `POST /runs/unpin`
+  - `GET /runs/active`
+- Freeze/unfreeze run directory writes:
+  - `POST /runs/{run_id}/freeze`
+  - `POST /runs/{run_id}/unfreeze`
+- Attach tags/notes metadata:
+  - `PUT /runs/{run_id}/tags`
+  - `GET /runs/{run_id}/tags`
+- Integrity + bundle:
+  - `GET /runs/{run_id}/integrity`
+  - `GET /runs/{run_id}/bundle.zip?artifacts=manifest.json,regimes.html`
+
+## Python Client
+
+Small helper client:
+
+```bash
+python -m scripts.client list_runs
+python -m scripts.client latest
+python -m scripts.client predict_current --include-probs
+```
 
 ### Example `curl` calls
 
