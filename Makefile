@@ -4,8 +4,10 @@ RUN ?= run_YYYYMMDDTHHMMSSZ_example
 A ?= run_A
 B ?= run_B
 TRASH ?= run_YYYYMMDDTHHMMSSZ_example_YYYYMMDDTHHMMSSZ
+NOTES ?= "run notes"
+EXTRAS ?=
 
-.PHONY: install test train plot api ui integrity bundle version drift report delete restore trash_list trash_purge
+.PHONY: install test train plot api ui integrity bundle version drift report delete restore trash_list trash_get trash_delete trash_purge notes_get notes_put alerts_evaluate compare_get forecast_v3
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -51,5 +53,26 @@ restore:
 trash_list:
 	curl -sS "http://127.0.0.1:8000/runs/trash"
 
+trash_get:
+	curl -sS "http://127.0.0.1:8000/runs/trash/$(TRASH)"
+
+trash_delete:
+	curl -sS -X DELETE "http://127.0.0.1:8000/runs/trash/$(TRASH)"
+
 trash_purge:
 	curl -sS -X DELETE "http://127.0.0.1:8000/runs/trash/$(TRASH)"
+
+notes_get:
+	curl -sS "http://127.0.0.1:8000/runs/$(RUN)/notes"
+
+notes_put:
+	curl -sS -X PUT "http://127.0.0.1:8000/runs/$(RUN)/notes" -H "Content-Type: application/json" -d '{"content":$(NOTES)}'
+
+alerts_evaluate:
+	curl -sS -X POST "http://127.0.0.1:8000/alerts/evaluate" -H "Content-Type: application/json" -d '{"run_id":"$(RUN)"}'
+
+compare_get:
+	curl -sS "http://127.0.0.1:8000/runs/$(A)/compare/$(B)"
+
+forecast_v3:
+	curl -sS "http://127.0.0.1:8000/forecast_v3?run_id=$(RUN)&horizon=10&interval=0.95"

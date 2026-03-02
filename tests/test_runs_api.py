@@ -8,6 +8,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import numpy as np
 from fastapi.testclient import TestClient
 
 import app.routes as routes
@@ -156,6 +157,25 @@ def test_latest_run_endpoint(monkeypatch, tmp_path: Path) -> None:
     assert payload["end_date"] == "2026-02-27"
     assert payload["last_label"] == "mid_vol"
     assert payload["last_date"] == "2026-02-27"
+
+
+def test_health_and_ready_with_empty_runs(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+
+    ready = client.get("/ready")
+    assert ready.status_code == 200
+    payload = ready.json()
+    assert payload["status"] == "ok"
+    assert payload["runs_root_exists"] is True
+    assert payload["latest"]["available"] is False
+    assert payload["active"]["source"] == "none"
 
 
 def test_run_model_endpoint(monkeypatch, tmp_path: Path) -> None:
@@ -891,6 +911,14 @@ def test_freeze_blocks_mutating_writes(monkeypatch, tmp_path: Path) -> None:
     tags_resp = client.put(f"/runs/{run_id}/tags", json={"tags": ["x"]})
     assert tags_resp.status_code == 409
     assert run_id in tags_resp.json()["detail"]
+    run_mutations = json.loads((run_dir / "mutations.json").read_text(encoding="utf-8"))
+    assert len(run_mutations.get("mutations", [])) == 1
+    assert run_mutations["mutations"][0]["action"] == "freeze.post"
+    global_audit = json.loads((runs_root / "_mutations_audit.json").read_text(encoding="utf-8"))
+    blocked = [m for m in global_audit["mutations"] if m["status"] == "blocked_attempt"]
+    assert len(blocked) >= 1
+    assert blocked[-1]["endpoint"] == "/runs/{run_id}/tags"
+    assert blocked[-1]["run_id"] == run_id
 
     events_resp = client.get(f"/runs/{run_id}/events")
     assert events_resp.status_code == 409
@@ -971,7 +999,46 @@ def test_bundle_zip_endpoint(monkeypatch, tmp_path: Path) -> None:
 
     with zipfile.ZipFile(io.BytesIO(response.content), mode="r") as zf:
         names = sorted(zf.namelist())
-        assert names == ["a.json", "b.html"]
+        assert names == ["a.json", "b.html", "integrity.json"]
+        assert zf.namelist() == sorted(zf.namelist())
+
+
+def test_bundle_zip_extras_opt_in(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260201T000000Z_bundle_extras"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "a.json").write_text('{"a":1}', encoding="utf-8")
+    hash_a = hashlib.sha256((run_dir / "a.json").read_bytes()).hexdigest()
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "schema_version": 1,
+                "artifacts": ["a.json", "manifest.json"],
+                "artifacts_sha256": {"a.json": hash_a},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    no_extras = client.get(f"/runs/{run_id}/bundle.zip")
+    assert no_extras.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(no_extras.content), mode="r") as zf:
+        names = sorted(zf.namelist())
+        assert names == ["a.json", "integrity.json", "manifest.json"]
+
+    with_extras = client.get(f"/runs/{run_id}/bundle.zip?extras=openapi,run_info")
+    assert with_extras.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(with_extras.content), mode="r") as zf:
+        names = sorted(zf.namelist())
+        assert "openapi.json" in names
+        assert "RUN_INFO.json" in names
+        assert "integrity.json" in names
+        assert zf.namelist() == sorted(zf.namelist())
 
 
 def test_compare_pinned_latest_and_transition_alerts(monkeypatch, tmp_path: Path) -> None:
@@ -1182,6 +1249,19 @@ def test_delete_and_restore_run_lifecycle(monkeypatch, tmp_path: Path) -> None:
     restore_resp = client.post(f"/runs/trash/{trash_id}/restore")
     assert restore_resp.status_code == 200
     assert (runs_root / run_b.name).exists()
+    global_audit = json.loads((runs_root / "_mutations_audit.json").read_text(encoding="utf-8"))
+    assert len(global_audit["mutations"]) >= 2
+    delete_entry = global_audit["mutations"][-2]
+    restore_entry = global_audit["mutations"][-1]
+    assert delete_entry["endpoint"] == "/runs/{run_id}"
+    assert delete_entry["run_id"] == run_b.name
+    assert delete_entry["trash_id"] == trash_id
+    assert delete_entry["status"] == "ok"
+    assert "ts_utc" in delete_entry
+    assert restore_entry["endpoint"] == "/runs/trash/{trash_id}/restore"
+    assert restore_entry["run_id"] == run_b.name
+    assert restore_entry["trash_id"] == trash_id
+    assert restore_entry["status"] == "ok"
 
 
 def test_delete_rejects_pinned_or_frozen(monkeypatch, tmp_path: Path) -> None:
@@ -1245,6 +1325,10 @@ def test_mutation_api_key_guard(monkeypatch, tmp_path: Path) -> None:
         headers={"X-API-Key": "secret"},
     )
     assert ok_tags.status_code == 200
+    global_audit = json.loads((runs_root / "_mutations_audit.json").read_text(encoding="utf-8"))
+    statuses = [entry["status"] for entry in global_audit["mutations"]]
+    assert "denied_auth" in statuses
+    assert "ok" in statuses
 
 
 def test_forecast_eval_endpoints(monkeypatch, tmp_path: Path) -> None:
@@ -1509,12 +1593,23 @@ def test_notes_and_mutations_endpoints(monkeypatch, tmp_path: Path) -> None:
     mutations = mutations_resp.json()["mutations"]
     assert len(mutations) == 1
     assert mutations[0]["action"] == "notes.put"
+    assert mutations[0]["endpoint"] == "/runs/{run_id}/notes"
+    assert mutations[0]["status"] == "ok"
+    assert mutations[0]["actor"] == "anonymous"
+    assert "ts_utc" in mutations[0]
+    assert mutations[0]["run_id"] == run_id
 
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert "notes.md" in manifest["artifacts"]
     assert "mutations.json" in manifest["artifacts"]
     assert "notes.md" in manifest["artifacts_sha256"]
     assert "mutations.json" in manifest["artifacts_sha256"]
+
+    global_audit_path = runs_root / "_mutations_audit.json"
+    assert global_audit_path.exists()
+    global_payload = json.loads(global_audit_path.read_text(encoding="utf-8"))
+    assert global_payload["mutations"][-1]["endpoint"] == "/runs/{run_id}/notes"
+    assert global_payload["mutations"][-1]["run_id"] == run_id
 
 
 def test_notes_put_respects_freeze_and_auth(monkeypatch, tmp_path: Path) -> None:
@@ -1638,11 +1733,14 @@ def test_forecast_v3_endpoint(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
     client = TestClient(app)
 
-    resp = client.get(f"/forecast_v3?run_id={run_id}&horizon=3")
+    resp = client.get(f"/forecast_v3?run_id={run_id}&horizon=3&include_stationary=true")
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["run_id"] == run_id
     assert payload["horizon"] == 3
+    assert payload["as_of"] == "2026-03-04"
+    assert payload["params_source"] == "model_params.json"
+    assert payload["label_mapping"]["2"] == "shock"
     assert len(payload["forecast"]) == 3
     first = payload["forecast"][0]
     assert "probs_by_label" in first
@@ -1651,10 +1749,47 @@ def test_forecast_v3_endpoint(monkeypatch, tmp_path: Path) -> None:
     assert "expected_vol" in first
     assert "interval_low" in first
     assert "interval_high" in first
+    assert payload["stationary"] is not None
+    assert len(payload["stationary"]["state_probs"]) == 3
+    assert set(payload["stationary"]["implied_durations_days"].keys()) == {"low_vol", "mid_vol", "shock"}
 
     missing_resp = client.get(f"/forecast_v3?run_id={missing_id}&horizon=2")
     assert missing_resp.status_code == 404
     assert "model_params.json" in missing_resp.json()["detail"]
+
+
+def test_forecast_v3_npz_fallback(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260304T000000Z_fcastv3_npz"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        run_dir / "model_params.npz",
+        transition_matrix=np.array([[0.9, 0.1], [0.2, 0.8]], dtype=float),
+        mu=np.array([0.001, -0.01], dtype=float),
+        sigma=np.array([0.01, 0.04], dtype=float),
+    )
+    (run_dir / "regime_labels.json").write_text(
+        json.dumps({"label_mapping": {"0": "low_vol", "1": "shock"}}),
+        encoding="utf-8",
+    )
+    (run_dir / "predict_proba.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-03-03", "2026-03-04"],
+                "returns": [0.01, -0.02],
+                "regime_probabilities": [[0.8, 0.2], [0.7, 0.3]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+    resp = client.get(f"/forecast_v3?run_id={run_id}&horizon=2")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["params_source"] == "model_params.npz"
+    assert len(payload["forecast"]) == 2
 
 
 def test_alerts_evaluate_endpoint(monkeypatch, tmp_path: Path) -> None:
@@ -1684,6 +1819,34 @@ def test_alerts_evaluate_endpoint(monkeypatch, tmp_path: Path) -> None:
         json.dumps({"horizons": [{"horizon": 1, "coverage": 0.7}]}),
         encoding="utf-8",
     )
+    (run_target / "transition_matrix.json").write_text(
+        json.dumps({"transition_matrix": [[0.6, 0.4, 0.0], [0.1, 0.8, 0.1], [0.2, 0.2, 0.6]]}),
+        encoding="utf-8",
+    )
+    (run_target / "regime_labels.json").write_text(
+        json.dumps({"label_mapping": {"0": "low_vol", "1": "mid_vol", "2": "shock"}}),
+        encoding="utf-8",
+    )
+    (run_target / "viterbi_states.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-03-03", "2026-03-04"],
+                "states": [0, 0],
+                "labels": ["low_vol", "low_vol"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_target / "predict_proba.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-03-03", "2026-03-04"],
+                "returns": [0.01, -0.02],
+                "regime_probabilities": [[0.2, 0.3, 0.5], [0.1, 0.2, 0.7]],
+            }
+        ),
+        encoding="utf-8",
+    )
     (run_base / "evaluation.json").write_text(
         json.dumps({"regime_diagnostics": {"transition_entropy": 0.2}}),
         encoding="utf-8",
@@ -1697,10 +1860,48 @@ def test_alerts_evaluate_endpoint(monkeypatch, tmp_path: Path) -> None:
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["run_id"] == run_target.name
+    assert payload["triggered"] is True
+    assert payload["selection"] == "run_id"
+    assert payload["current_regime_label"] == "low_vol"
+    assert payload["shock_prob"] == 0.7
+    assert payload["transition_alert"]["triggered"] is True
+    assert "recommended_action" in payload
     ids = {row["id"] for row in payload["alerts"]}
     assert "shock_occupancy_high" in ids
     assert "forecast_coverage_low" in ids
     assert "transition_entropy_jump" in ids
+    assert "transition_probability_high" in ids
+
+
+def test_alerts_evaluate_missing_proba(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260304T000000Z_alert_missing_proba"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "regime_summary.json").write_text(
+        json.dumps({"regimes": [{"label": "shock", "avg_posterior_probability": 0.1}]}),
+        encoding="utf-8",
+    )
+    (run_dir / "evaluation.json").write_text(
+        json.dumps({"regime_diagnostics": {"transition_entropy": 0.3}}),
+        encoding="utf-8",
+    )
+    (run_dir / "transition_matrix.json").write_text(
+        json.dumps({"transition_matrix": [[0.95, 0.05], [0.1, 0.9]]}),
+        encoding="utf-8",
+    )
+    (run_dir / "viterbi_states.json").write_text(
+        json.dumps({"dates": ["2026-03-04"], "states": [0], "labels": ["low_vol"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+    resp = client.post("/alerts/evaluate", json={"use_latest": True})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["run_id"] == run_id
+    assert payload["shock_prob"] is None
+    assert payload["selection"] == "latest"
 
 
 def test_compare_view_endpoint(monkeypatch, tmp_path: Path) -> None:
@@ -1746,6 +1947,24 @@ def test_compare_view_endpoint(monkeypatch, tmp_path: Path) -> None:
     (run_b / "regime_summary.json").write_text(json.dumps(summary_b), encoding="utf-8")
     (run_a / "transition_matrix.json").write_text(json.dumps(transition_stub), encoding="utf-8")
     (run_b / "transition_matrix.json").write_text(json.dumps(transition_stub), encoding="utf-8")
+    (run_a / "viterbi_states.json").write_text(
+        json.dumps({"dates": ["2026-03-04"], "states": [0], "labels": ["low_vol"]}),
+        encoding="utf-8",
+    )
+    (run_b / "viterbi_states.json").write_text(
+        json.dumps({"dates": ["2026-03-05"], "states": [1], "labels": ["shock"]}),
+        encoding="utf-8",
+    )
+    (run_a / "tags.json").write_text(
+        json.dumps({"tags": ["prod", "daily"]}),
+        encoding="utf-8",
+    )
+    (run_b / "tags.json").write_text(
+        json.dumps({"tags": ["prod", "candidate"]}),
+        encoding="utf-8",
+    )
+    (run_a / "notes.md").write_text("same content", encoding="utf-8")
+    (run_b / "notes.md").write_text("changed content", encoding="utf-8")
 
     monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
     client = TestClient(app)
@@ -1758,3 +1977,12 @@ def test_compare_view_endpoint(monkeypatch, tmp_path: Path) -> None:
     assert "drift" in payload
     assert "metrics_diff" in payload
     assert "events_diff" in payload
+    assert "delta_best_val_ll" in payload
+    assert "delta_transition_entropy" in payload
+    assert "delta_shock_occupancy" in payload
+    assert payload["delta_last_label"] == "low_vol -> shock"
+    assert payload["delta_last_date"] == "2026-03-04 -> 2026-03-05"
+    assert payload["notes_diff_hint"] == "changed"
+    assert payload["tags_diff"]["shared"] == ["prod"]
+    assert payload["tags_diff"]["only_in_a"] == ["daily"]
+    assert payload["tags_diff"]["only_in_b"] == ["candidate"]

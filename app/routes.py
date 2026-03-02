@@ -47,6 +47,7 @@ _JSON_CACHE_FILENAMES = {
 }
 _JSON_READ_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
 _MODEL_PARAMS_CACHE: dict[str, tuple[int, dict[str, np.ndarray]]] = {}
+_GLOBAL_MUTATION_AUDIT_FILENAME = "_mutations_audit.json"
 
 
 def _safe_git_commit_hash() -> str | None:
@@ -133,6 +134,8 @@ class AlertsEvaluateRequest(BaseModel):
 
     run_id: str | None = Field(default=None)
     use_pinned: bool = Field(default=False)
+    use_active: bool = Field(default=False)
+    use_latest: bool = Field(default=False)
     rules: dict[str, Any] | None = Field(default=None)
 
 
@@ -256,6 +259,37 @@ def version() -> dict[str, Any]:
     }
 
 
+@router.get("/ready")
+def ready() -> dict[str, Any]:
+    """Release-readiness snapshot; always 200 even when no runs exist."""
+    runs_root_exists = RUNS_ROOT.exists()
+    pinned_run_id = _read_pinned_run_id_or_none()
+    run_ids = _list_run_ids() if runs_root_exists else []
+    latest_run_id = run_ids[0] if run_ids else None
+    if pinned_run_id is not None:
+        active_run_id = pinned_run_id
+        active_source = "pinned"
+    elif latest_run_id is not None:
+        active_run_id = latest_run_id
+        active_source = "latest"
+    else:
+        active_run_id = None
+        active_source = "none"
+    return {
+        "status": "ok",
+        "runs_root": str(RUNS_ROOT),
+        "runs_root_exists": runs_root_exists,
+        "pinned": {"available": pinned_run_id is not None, "run_id": pinned_run_id},
+        "latest": {"available": latest_run_id is not None, "run_id": latest_run_id},
+        "active": {"run_id": active_run_id, "source": active_source},
+        "version": {
+            **_version_fields(),
+            "git_commit_hash": GIT_COMMIT_HASH,
+            "built_at_utc": BUILT_AT_UTC,
+        },
+    }
+
+
 @router.get("/runs")
 def list_runs(
     request: Request,
@@ -292,36 +326,86 @@ def pinned_run() -> dict[str, str]:
 @router.post("/runs/{run_id}/pin")
 def pin_run(run_id: str, request: Request) -> dict[str, str]:
     """Pin a specific run id for production-style workflows."""
-    _require_mutation_auth(request)
+    actor = _require_mutation_auth(
+        request,
+        endpoint="/runs/{run_id}/pin",
+        run_id=run_id,
+        payload_summary={"run_id": run_id},
+    )
     _validate_run_id_for_pin(run_id)
     run_path = RUNS_ROOT / run_id
     if not run_path.exists() or not run_path.is_dir():
         raise HTTPException(status_code=404, detail=f"Run not found for pinning: {run_id}")
 
     _pinned_run_file().write_text(run_id, encoding="utf-8")
+    _append_global_mutation(
+        endpoint="/runs/{run_id}/pin",
+        actor=actor,
+        run_id=run_id,
+        payload_summary={"run_id": run_id},
+        status="ok",
+    )
     return {"pinned_run_id": run_id}
 
 
 @router.post("/runs/unpin")
 def unpin_run(request: Request) -> dict[str, bool]:
     """Remove pinned run pointer if present."""
-    _require_mutation_auth(request)
+    current = _read_pinned_run_id_or_none()
+    actor = _require_mutation_auth(
+        request,
+        endpoint="/runs/unpin",
+        run_id=current,
+        payload_summary={"pinned_run_id": current},
+    )
     pinned_path = _pinned_run_file()
     if not pinned_path.exists():
+        _append_global_mutation(
+            endpoint="/runs/unpin",
+            actor=actor,
+            run_id=current,
+            payload_summary={"pinned_run_id": current},
+            status="noop",
+        )
         return {"unpinned": False}
     pinned_path.unlink()
+    _append_global_mutation(
+        endpoint="/runs/unpin",
+        actor=actor,
+        run_id=current,
+        payload_summary={"pinned_run_id": current},
+        status="ok",
+    )
     return {"unpinned": True}
 
 
 @router.delete("/runs/{run_id}")
 def delete_run(run_id: str, request: Request) -> dict[str, Any]:
     """Soft-delete a run by moving it under runs/_trash/."""
-    _require_mutation_auth(request)
+    actor = _require_mutation_auth(
+        request,
+        endpoint="/runs/{run_id}",
+        run_id=run_id,
+        payload_summary={"run_id": run_id},
+    )
     run_path = _resolve_run_path(run_id)
     if _read_pinned_run_id_or_none() == run_id:
+        _append_global_mutation(
+            endpoint="/runs/{run_id}",
+            actor=actor,
+            run_id=run_id,
+            payload_summary={"run_id": run_id},
+            status="blocked_pinned",
+        )
         raise HTTPException(status_code=409, detail=f"Run {run_id} is pinned and cannot be deleted")
-    if _is_run_frozen(run_path):
-        raise HTTPException(status_code=409, detail=f"Run {run_id} is frozen and cannot be deleted")
+    _assert_run_not_frozen(
+        run_id=run_id,
+        run_path=run_path,
+        action="delete run",
+        endpoint="/runs/{run_id}",
+        actor=actor,
+        payload_summary={"run_id": run_id},
+    )
 
     trash_root = _trash_root()
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -329,6 +413,14 @@ def delete_run(run_id: str, request: Request) -> dict[str, Any]:
     trash_path = trash_root / trash_id
     run_path.rename(trash_path)
     _reconcile_latest_pointer()
+    _append_global_mutation(
+        endpoint="/runs/{run_id}",
+        actor=actor,
+        run_id=run_id,
+        trash_id=trash_id,
+        payload_summary={"run_id": run_id, "trash_id": trash_id},
+        status="ok",
+    )
     return {
         "run_id": run_id,
         "trash_id": trash_id,
@@ -339,7 +431,12 @@ def delete_run(run_id: str, request: Request) -> dict[str, Any]:
 @router.post("/runs/trash/{trash_id}/restore")
 def restore_run(trash_id: str, request: Request) -> dict[str, Any]:
     """Restore a previously trashed run back under runs/."""
-    _require_mutation_auth(request)
+    actor = _require_mutation_auth(
+        request,
+        endpoint="/runs/trash/{trash_id}/restore",
+        trash_id=trash_id,
+        payload_summary={"trash_id": trash_id},
+    )
     trash_path = _trash_root() / trash_id
     if not trash_path.exists() or not trash_path.is_dir():
         raise HTTPException(status_code=404, detail=f"Trash entry not found: {trash_id}")
@@ -357,6 +454,14 @@ def restore_run(trash_id: str, request: Request) -> dict[str, Any]:
 
     trash_path.rename(restored_path)
     _reconcile_latest_pointer()
+    _append_global_mutation(
+        endpoint="/runs/trash/{trash_id}/restore",
+        actor=actor,
+        run_id=restored_run_id,
+        trash_id=trash_id,
+        payload_summary={"trash_id": trash_id, "restored_run_id": restored_run_id},
+        status="ok",
+    )
     return {
         "restored_run_id": restored_run_id,
         "run_dir": str(restored_path),
@@ -391,12 +496,25 @@ def get_trashed_run(trash_id: str) -> dict[str, Any]:
 @router.delete("/runs/trash/{trash_id}")
 def purge_trashed_run(trash_id: str, request: Request) -> dict[str, Any]:
     """Permanently delete a trash entry from disk."""
-    _require_mutation_auth(request)
+    actor = _require_mutation_auth(
+        request,
+        endpoint="/runs/trash/{trash_id}",
+        trash_id=trash_id,
+        payload_summary={"trash_id": trash_id},
+    )
     trash_path = _trash_root() / trash_id
     if not trash_path.exists() or not trash_path.is_dir():
         raise HTTPException(status_code=404, detail=f"Trash entry not found: {trash_id}")
     item = _trash_item_payload(trash_id)
     shutil.rmtree(trash_path)
+    _append_global_mutation(
+        endpoint="/runs/trash/{trash_id}",
+        actor=actor,
+        run_id=str(item.get("original_run_id")) if item.get("original_run_id") is not None else None,
+        trash_id=trash_id,
+        payload_summary={"trash_id": trash_id},
+        status="ok",
+    )
     return {
         "trash_id": trash_id,
         "original_run_id": item.get("original_run_id"),
@@ -574,6 +692,7 @@ def download_run_bundle(
     run_id: str,
     request: Request,
     artifacts: str | None = Query(default=None),
+    extras: str | None = Query(default=None),
 ) -> StreamingResponse:
     """Download selected run artifacts as a zip bundle."""
     run_path = _resolve_run_path(run_id)
@@ -588,8 +707,14 @@ def download_run_bundle(
             ),
         )
 
-    generated_names = {"report.md", "report.html", "openapi.json", "RUN_INFO.json"}
-    generated_artifacts: dict[str, bytes] = {}
+    generated_artifacts: dict[str, bytes] = {
+        "integrity.json": json.dumps(integrity, indent=2).encode("utf-8")
+    }
+    extras_set = {piece.strip().lower() for piece in (extras or "").split(",") if piece.strip()}
+    include_report_extra = "report" in extras_set
+    include_openapi_extra = "openapi" in extras_set
+    include_run_info_extra = "run_info" in extras_set
+
     if artifacts is None:
         names_raw = manifest.get("artifacts", [])
         if not isinstance(names_raw, list):
@@ -598,23 +723,45 @@ def download_run_bundle(
                 detail=f"Run {run_id} has malformed artifact: manifest.json",
             )
         artifact_names = [str(name) for name in names_raw]
-        generated_artifacts = _build_bundle_generated_artifacts(
+    else:
+        artifact_names = [name.strip() for name in artifacts.split(",") if name.strip()]
+
+    include_report_extra = include_report_extra or any(
+        name in {"report.md", "report.html"} for name in artifact_names
+    )
+    include_openapi_extra = include_openapi_extra or any(
+        name == "openapi.json" for name in artifact_names
+    )
+    include_run_info_extra = include_run_info_extra or any(
+        name == "RUN_INFO.json" for name in artifact_names
+    )
+
+    if include_report_extra or include_openapi_extra or include_run_info_extra:
+        generated_extras = _build_bundle_generated_artifacts(
             run_id=run_id,
             run_path=run_path,
             request=request,
         )
-        artifact_names.extend(generated_artifacts.keys())
-    else:
-        artifact_names = [name.strip() for name in artifacts.split(",") if name.strip()]
-        if any(name in generated_names for name in artifact_names):
-            generated_artifacts = _build_bundle_generated_artifacts(
-                run_id=run_id,
-                run_path=run_path,
-                request=request,
-            )
+        if include_report_extra:
+            report_md = generated_extras.get("report.md")
+            report_html = generated_extras.get("report.html")
+            if report_md is None or report_html is None:
+                fallback_md = f"# Run Report: {run_id}\n\nNo report content available.\n"
+                report_md = fallback_md.encode("utf-8")
+                report_html = _render_markdown_pre_html(fallback_md, run_id=run_id).encode("utf-8")
+            generated_artifacts["report.md"] = report_md
+            generated_artifacts["report.html"] = report_html
+            artifact_names.extend(["report.md", "report.html"])
+        if include_openapi_extra and "openapi.json" in generated_extras:
+            generated_artifacts["openapi.json"] = generated_extras["openapi.json"]
+            artifact_names.append("openapi.json")
+        if include_run_info_extra and "RUN_INFO.json" in generated_extras:
+            generated_artifacts["RUN_INFO.json"] = generated_extras["RUN_INFO.json"]
+            artifact_names.append("RUN_INFO.json")
 
     if not artifact_names:
         raise HTTPException(status_code=400, detail=f"Run {run_id} has no artifacts to bundle")
+    artifact_names.append("integrity.json")
     deduped_names: list[str] = []
     seen: set[str] = set()
     for name in artifact_names:
@@ -627,6 +774,7 @@ def download_run_bundle(
             continue
         seen.add(name)
         deduped_names.append(name)
+    deduped_names = sorted(deduped_names)
 
     missing = [
         name
@@ -678,10 +826,23 @@ def get_run_tags(run_id: str) -> dict[str, Any]:
 @router.put("/runs/{run_id}/tags")
 def put_run_tags(run_id: str, request: RunTagsRequest, raw_request: Request) -> dict[str, Any]:
     """Create or update tags metadata for a run and stamp manifest provenance."""
-    _require_mutation_auth(raw_request)
-    run_path = _resolve_run_path(run_id)
-    _assert_run_not_frozen(run_id=run_id, run_path=run_path, action="update tags")
     tags = sorted({str(tag).strip() for tag in request.tags if str(tag).strip()})
+    payload_summary = {"tags_count": len(tags), "has_notes": request.notes is not None}
+    actor = _require_mutation_auth(
+        raw_request,
+        endpoint="/runs/{run_id}/tags",
+        run_id=run_id,
+        payload_summary=payload_summary,
+    )
+    run_path = _resolve_run_path(run_id)
+    _assert_run_not_frozen(
+        run_id=run_id,
+        run_path=run_path,
+        action="update tags",
+        endpoint="/runs/{run_id}/tags",
+        actor=actor,
+        payload_summary=payload_summary,
+    )
     payload = {
         "tags": tags,
         "notes": request.notes,
@@ -689,6 +850,22 @@ def put_run_tags(run_id: str, request: RunTagsRequest, raw_request: Request) -> 
     }
     _write_json(run_path / "tags.json", payload)
     _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="tags.json")
+    _append_run_mutation(
+        run_id=run_id,
+        run_path=run_path,
+        action="tags.put",
+        details={"tags": tags},
+        actor=actor,
+        endpoint="/runs/{run_id}/tags",
+        payload_summary=payload_summary,
+    )
+    _append_global_mutation(
+        endpoint="/runs/{run_id}/tags",
+        actor=actor,
+        run_id=run_id,
+        payload_summary=payload_summary,
+        status="ok",
+    )
     return payload
 
 
@@ -705,9 +882,22 @@ def get_run_notes(run_id: str) -> dict[str, Any]:
 @router.put("/runs/{run_id}/notes")
 def put_run_notes(run_id: str, request: RunNotesRequest, raw_request: Request) -> dict[str, Any]:
     """Create or update notes.md and append to the run mutation audit log."""
-    _require_mutation_auth(raw_request)
+    payload_summary = {"content_length": len(request.content)}
+    actor = _require_mutation_auth(
+        raw_request,
+        endpoint="/runs/{run_id}/notes",
+        run_id=run_id,
+        payload_summary=payload_summary,
+    )
     run_path = _resolve_run_path(run_id)
-    _assert_run_not_frozen(run_id=run_id, run_path=run_path, action="update notes")
+    _assert_run_not_frozen(
+        run_id=run_id,
+        run_path=run_path,
+        action="update notes",
+        endpoint="/runs/{run_id}/notes",
+        actor=actor,
+        payload_summary=payload_summary,
+    )
 
     notes_path = run_path / "notes.md"
     notes_path.write_text(request.content, encoding="utf-8")
@@ -718,11 +908,21 @@ def put_run_notes(run_id: str, request: RunNotesRequest, raw_request: Request) -
         run_path=run_path,
         action="notes.put",
         details={"content_length": len(request.content)},
+        actor=actor,
+        endpoint="/runs/{run_id}/notes",
+        payload_summary=payload_summary,
+    )
+    _append_global_mutation(
+        endpoint="/runs/{run_id}/notes",
+        actor=actor,
+        run_id=run_id,
+        payload_summary=payload_summary,
+        status="ok",
     )
     return {
         "run_id": run_id,
         "content": request.content,
-        "updated_at_utc": mutation["at_utc"],
+        "updated_at_utc": mutation["ts_utc"],
     }
 
 
@@ -747,9 +947,24 @@ def freeze_run(
     request: FreezeRunRequest | None = None,
 ) -> dict[str, Any]:
     """Freeze a run to prevent mutating artifacts inside run dir."""
-    _require_mutation_auth(raw_request)
-    run_path = _resolve_run_path(run_id)
     reason = request.reason if request is not None else None
+    payload_summary = {"reason": reason}
+    actor = _require_mutation_auth(
+        raw_request,
+        endpoint="/runs/{run_id}/freeze",
+        run_id=run_id,
+        payload_summary=payload_summary,
+    )
+    run_path = _resolve_run_path(run_id)
+    if _is_run_frozen(run_path):
+        _append_global_mutation(
+            endpoint="/runs/{run_id}/freeze",
+            actor=actor,
+            run_id=run_id,
+            payload_summary=payload_summary,
+            status="blocked_attempt",
+        )
+        raise HTTPException(status_code=409, detail=f"Run {run_id} is frozen; cannot freeze again.")
     payload = {
         "frozen": True,
         "reason": reason,
@@ -757,16 +972,44 @@ def freeze_run(
     }
     _write_json(run_path / "frozen.json", payload)
     _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="frozen.json")
+    _append_run_mutation(
+        run_id=run_id,
+        run_path=run_path,
+        action="freeze.post",
+        details={"reason": reason},
+        actor=actor,
+        endpoint="/runs/{run_id}/freeze",
+        payload_summary=payload_summary,
+    )
+    _append_global_mutation(
+        endpoint="/runs/{run_id}/freeze",
+        actor=actor,
+        run_id=run_id,
+        payload_summary=payload_summary,
+        status="ok",
+    )
     return {"run_id": run_id, **payload}
 
 
 @router.post("/runs/{run_id}/unfreeze")
 def unfreeze_run(run_id: str, request: Request) -> dict[str, Any]:
     """Unfreeze a run by deleting frozen.json when present."""
-    _require_mutation_auth(request)
+    actor = _require_mutation_auth(
+        request,
+        endpoint="/runs/{run_id}/unfreeze",
+        run_id=run_id,
+        payload_summary={"run_id": run_id},
+    )
     run_path = _resolve_run_path(run_id)
     frozen_path = run_path / "frozen.json"
     if not frozen_path.exists():
+        _append_global_mutation(
+            endpoint="/runs/{run_id}/unfreeze",
+            actor=actor,
+            run_id=run_id,
+            payload_summary={"run_id": run_id},
+            status="noop",
+        )
         return {"run_id": run_id, "unfrozen": False}
     frozen_path.unlink()
     manifest_path = run_path / "manifest.json"
@@ -777,6 +1020,22 @@ def unfreeze_run(run_id: str, request: Request) -> dict[str, Any]:
             manifest["artifacts"] = [name for name in artifacts if name != "frozen.json"]
             write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest)
             _invalidate_json_cache(run_path / "manifest.json")
+    _append_run_mutation(
+        run_id=run_id,
+        run_path=run_path,
+        action="unfreeze.post",
+        details={},
+        actor=actor,
+        endpoint="/runs/{run_id}/unfreeze",
+        payload_summary={"run_id": run_id},
+    )
+    _append_global_mutation(
+        endpoint="/runs/{run_id}/unfreeze",
+        actor=actor,
+        run_id=run_id,
+        payload_summary={"run_id": run_id},
+        status="ok",
+    )
     return {"run_id": run_id, "unfrozen": True}
 
 
@@ -814,13 +1073,51 @@ def compare_run_pair(run_id: str, other_run_id: str) -> dict[str, Any]:
         run_a_path=run_a_path,
         run_b_path=run_b_path,
     )
+    metrics_diff = compare_payload.get("diffs", {})
+    latest_a = _latest_run_payload(run_id=run_id, run_path=run_a_path)
+    latest_b = _latest_run_payload(run_id=other_run_id, run_path=run_b_path)
+    last_label_a = latest_a.get("last_label")
+    last_label_b = latest_b.get("last_label")
+    last_date_a = latest_a.get("last_date")
+    last_date_b = latest_b.get("last_date")
+
+    tags_a = _read_tags_set(run_a_path)
+    tags_b = _read_tags_set(run_b_path)
+    shared_tags = sorted(tags_a & tags_b)
+    only_a = sorted(tags_a - tags_b)
+    only_b = sorted(tags_b - tags_a)
+
+    notes_a = _read_notes_content(run_a_path)
+    notes_b = _read_notes_content(run_b_path)
+    if notes_a is None and notes_b is None:
+        notes_diff_hint = "missing"
+    elif notes_a == notes_b:
+        notes_diff_hint = "same"
+    else:
+        notes_diff_hint = "changed"
+
     return {
         "run_a": run_id,
         "run_b": other_run_id,
         "drift": drift_payload,
-        "metrics_diff": compare_payload.get("diffs", {}),
+        "metrics_diff": metrics_diff,
         "events_diff": drift_payload.get("event_deltas", {}),
         "compare": compare_payload,
+        "delta_best_val_ll": metrics_diff.get("delta_best_val_ll"),
+        "delta_transition_entropy": metrics_diff.get("delta_transition_entropy"),
+        "delta_shock_occupancy": metrics_diff.get("delta_shock_occupancy"),
+        "delta_last_label": (
+            None if last_label_a == last_label_b else f"{last_label_a} -> {last_label_b}"
+        ),
+        "delta_last_date": (
+            None if last_date_a == last_date_b else f"{last_date_a} -> {last_date_b}"
+        ),
+        "notes_diff_hint": notes_diff_hint,
+        "tags_diff": {
+            "shared": shared_tags,
+            "only_in_a": only_a,
+            "only_in_b": only_b,
+        },
     }
 
 
@@ -911,7 +1208,12 @@ def transition_alerts(request: TransitionAlertRequest) -> dict[str, Any]:
 @router.post("/alerts/evaluate")
 def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
     """Evaluate simple artifact-based alert rules for a run."""
-    run_id = _resolve_effective_run_id(run_id=request.run_id, use_pinned=request.use_pinned)
+    run_id, selection = _resolve_alert_selection(
+        run_id=request.run_id,
+        use_pinned=bool(request.use_pinned),
+        use_active=bool(request.use_active),
+        use_latest=bool(request.use_latest),
+    )
     run_path = _resolve_run_path(run_id)
     summary = _read_json(run_path / "regime_summary.json", run_id=run_id)
     evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
@@ -921,6 +1223,7 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
         "transition_entropy_jump_threshold": 0.15,
         "coverage_threshold": 0.9,
         "coverage_horizon": 1,
+        "transition_prob_threshold": 0.35,
     }
     rules = {**defaults, **(request.rules or {})}
 
@@ -1022,10 +1325,100 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
                     }
                 )
 
+    current_regime_label: str | None = None
+    current_state: int | None = None
+    shock_prob: float | None = None
+    prob_info: dict[str, Any] | None = None
+    try:
+        current_payload = _predict_current_impl(
+            request=PredictCurrentRequest(run_id=run_id),
+            include_probs=True,
+        )
+        current_regime_label = str(current_payload.get("label"))
+        state_value = current_payload.get("state")
+        current_state = int(state_value) if state_value is not None else None
+        probs_value = current_payload.get("probs")
+        if isinstance(probs_value, dict):
+            maybe_shock_prob = _as_float_or_none(probs_value.get("shock"))
+            if maybe_shock_prob is not None:
+                shock_prob = maybe_shock_prob
+        prob_info = _load_last_prob_info(
+            run_id=run_id,
+            proba_path=run_path / "predict_proba.json",
+            labels_map=_with_default_labels(_read_label_mapping(run_path), 3),
+        ) if (run_path / "predict_proba.json").exists() else None
+    except HTTPException:
+        current_regime_label = None
+        current_state = None
+        shock_prob = None
+
+    transition_alert: dict[str, Any] | None = None
+    transition_threshold = _as_float_or_none(rules.get("transition_prob_threshold"))
+    transition_path = run_path / "transition_matrix.json"
+    if transition_path.exists() and transition_threshold is not None:
+        transition_payload = _read_json(transition_path, run_id=run_id)
+        matrix = np.asarray(transition_payload.get("transition_matrix", []), dtype=np.float64)
+        if matrix.ndim == 2 and matrix.shape[0] > 0:
+            if current_state is None and prob_info is not None:
+                current_state = int(prob_info["state"])
+            if current_state is not None and 0 <= current_state < matrix.shape[0]:
+                row = np.asarray(matrix[current_state], dtype=np.float64)
+                if row.shape[0] > 1:
+                    transition_probs = row.copy()
+                    transition_probs[current_state] = -np.inf
+                    to_state = int(np.argmax(transition_probs))
+                    to_prob = float(row[to_state])
+                    labels_map = _with_default_labels(_read_label_mapping(run_path), int(row.shape[0]))
+                    transition_alert = {
+                        "triggered": bool(to_prob > transition_threshold),
+                        "from_state": int(current_state),
+                        "to_state": int(to_state),
+                        "from_label": labels_map.get(str(current_state), f"regime_{current_state}"),
+                        "to_label": labels_map.get(str(to_state), f"regime_{to_state}"),
+                        "probability": to_prob,
+                        "threshold": float(transition_threshold),
+                    }
+                    if transition_alert["triggered"]:
+                        alerts.append(
+                            {
+                                "id": "transition_probability_high",
+                                "severity": "warning",
+                                "message": (
+                                    f"One-step transition probability {to_prob:.4f} exceeds threshold "
+                                    f"{float(transition_threshold):.4f} for run {run_id}"
+                                ),
+                                "evidence": {
+                                    "run_id": run_id,
+                                    **transition_alert,
+                                },
+                            }
+                        )
+
+    triggered = bool(len(alerts) > 0)
+    if triggered:
+        recommended_action = (
+            "Review run diagnostics and consider pinning a stable baseline run before promoting changes."
+        )
+    else:
+        recommended_action = "No immediate action required; continue monitoring."
     return {
         "run_id": run_id,
+        "selection": selection,
         "baseline_run_id": baseline_run_id,
         "rules": rules,
+        "threshold_used": {
+            "shock_occupancy_threshold": _as_float_or_none(rules.get("shock_occupancy_threshold")),
+            "transition_entropy_jump_threshold": _as_float_or_none(
+                rules.get("transition_entropy_jump_threshold")
+            ),
+            "coverage_threshold": _as_float_or_none(rules.get("coverage_threshold")),
+            "transition_prob_threshold": _as_float_or_none(rules.get("transition_prob_threshold")),
+        },
+        "current_regime_label": current_regime_label,
+        "shock_prob": shock_prob,
+        "transition_alert": transition_alert,
+        "triggered": triggered,
+        "recommended_action": recommended_action,
         "count": len(alerts),
         "alerts": alerts,
         **_version_fields(),
@@ -1694,15 +2087,12 @@ def forecast_v3(
     use_pinned: bool = Query(default=False),
     horizon: int = Query(default=10, ge=1, le=365),
     interval: float = Query(default=0.95, gt=0.0, lt=1.0),
+    include_stationary: bool = Query(default=False),
 ) -> dict[str, Any]:
     """Return additive forecast schema with labeled and raw state moments."""
     resolved_run_id = _resolve_effective_run_id(run_id=run_id, use_pinned=use_pinned)
     run_path = _resolve_run_path(resolved_run_id)
-    model_json_path = run_path / "model_params.json"
-    if not model_json_path.exists():
-        raise _artifact_not_found(run_path.name, ["model_params.json"])
-
-    model_params = _load_model_params_cached(model_json_path)
+    model_params, params_source = _load_forecast_model_params_with_source(run_path)
     probs_payload = _read_json(run_path / "predict_proba.json", run_id=run_path.name)
     regime_probabilities = np.asarray(probs_payload.get("regime_probabilities", []), dtype=np.float64)
     dates = probs_payload.get("dates", [])
@@ -1750,9 +2140,17 @@ def forecast_v3(
     return {
         "run_id": run_path.name,
         "as_of_date": str(dates[-1]),
+        "as_of": str(dates[-1]),
         "horizon": int(horizon),
         "interval": float(interval),
+        "params_source": params_source,
+        "label_mapping": labels_map,
         "forecast": rows,
+        "stationary": (
+            _stationary_payload(transition_matrix=transition_matrix, labels_map=labels_map)
+            if include_stationary
+            else None
+        ),
         **_version_fields(),
     }
 
@@ -1802,6 +2200,27 @@ def _resolve_effective_run_id(run_id: str | None, use_pinned: bool) -> str:
     if use_pinned:
         return _read_pinned_run_id_or_404()
     return _latest_run_id_or_404()
+
+
+def _resolve_alert_selection(
+    *,
+    run_id: str | None,
+    use_pinned: bool,
+    use_active: bool,
+    use_latest: bool,
+) -> tuple[str, str]:
+    if run_id is not None:
+        return run_id, "run_id"
+    if use_active:
+        pinned = _read_pinned_run_id_or_none()
+        if pinned is not None:
+            return pinned, "active"
+        return _latest_run_id_or_404(), "active"
+    if use_pinned:
+        return _read_pinned_run_id_or_404(), "pinned"
+    if use_latest:
+        return _latest_run_id_or_404(), "latest"
+    return _latest_run_id_or_404(), "latest"
 
 
 def _pinned_run_file() -> Path:
@@ -1920,8 +2339,25 @@ def _is_run_frozen(run_path: Path) -> bool:
     return bool(payload.get("frozen", True))
 
 
-def _assert_run_not_frozen(run_id: str, run_path: Path, action: str) -> None:
+def _assert_run_not_frozen(
+    run_id: str,
+    run_path: Path,
+    action: str,
+    *,
+    endpoint: str | None = None,
+    actor: str | None = None,
+    payload_summary: dict[str, Any] | None = None,
+    trash_id: str | None = None,
+) -> None:
     if _is_run_frozen(run_path):
+        _append_global_mutation(
+            endpoint=endpoint or action,
+            actor=actor or "anonymous",
+            payload_summary=payload_summary,
+            run_id=run_id,
+            trash_id=trash_id,
+            status="blocked_attempt",
+        )
         raise HTTPException(
             status_code=409,
             detail=f"Run {run_id} is frozen; cannot {action}.",
@@ -1954,6 +2390,11 @@ def _append_run_mutation(
     run_path: Path,
     action: str,
     details: dict[str, Any] | None = None,
+    *,
+    actor: str = "anonymous",
+    endpoint: str | None = None,
+    payload_summary: dict[str, Any] | None = None,
+    status: str = "ok",
 ) -> dict[str, Any]:
     mutation_path = run_path / "mutations.json"
     if mutation_path.exists():
@@ -1965,10 +2406,17 @@ def _append_run_mutation(
         payload = {"run_id": run_id, "mutations": []}
         mutations = []
 
+    ts = datetime.now(timezone.utc).isoformat()
     entry = {
-        "at_utc": datetime.now(timezone.utc).isoformat(),
+        "at_utc": ts,
+        "ts_utc": ts,
         "action": str(action),
+        "endpoint": str(endpoint or action),
+        "actor": str(actor),
+        "status": str(status),
+        "payload_summary": payload_summary or {},
         "details": details or {},
+        "run_id": run_id,
     }
     mutations.append(entry)
     payload["run_id"] = run_id
@@ -1976,6 +2424,53 @@ def _append_run_mutation(
     _write_json(mutation_path, payload)
     _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="mutations.json")
     return entry
+
+
+def _global_mutation_audit_path() -> Path:
+    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    return RUNS_ROOT / _GLOBAL_MUTATION_AUDIT_FILENAME
+
+
+def _append_global_mutation(
+    *,
+    endpoint: str,
+    actor: str,
+    payload_summary: dict[str, Any] | None = None,
+    run_id: str | None = None,
+    trash_id: str | None = None,
+    status: str = "ok",
+) -> dict[str, Any]:
+    path = _global_mutation_audit_path()
+    if path.exists():
+        try:
+            payload = _read_json(path)
+        except HTTPException:
+            payload = {"mutations": []}
+    else:
+        payload = {"mutations": []}
+    mutations = payload.get("mutations", [])
+    if not isinstance(mutations, list):
+        mutations = []
+    entry = {
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+        "actor": str(actor),
+        "endpoint": str(endpoint),
+        "payload_summary": payload_summary or {},
+        "run_id": run_id,
+        "trash_id": trash_id,
+        "status": str(status),
+    }
+    mutations.append(entry)
+    payload["mutations"] = mutations
+    _write_json(path, payload)
+    return entry
+
+
+def _actor_from_request(request: Request) -> str:
+    expected = os.getenv("REGIME_API_KEY")
+    if expected and request.headers.get("X-API-Key") == expected:
+        return "api_key"
+    return "anonymous"
 
 
 def _latest_run_payload(run_id: str, run_path: Path) -> dict[str, Any]:
@@ -2033,6 +2528,24 @@ def _read_label_mapping(run_path: Path) -> dict[str, str]:
         if isinstance(mapping, dict):
             return {str(k): str(v) for k, v in mapping.items()}
     return {}
+
+
+def _read_tags_set(run_path: Path) -> set[str]:
+    tags_path = run_path / "tags.json"
+    if not tags_path.exists():
+        return set()
+    payload = _read_json(tags_path, run_id=run_path.name)
+    tags = payload.get("tags", [])
+    if not isinstance(tags, list):
+        return set()
+    return {str(tag) for tag in tags if str(tag).strip()}
+
+
+def _read_notes_content(run_path: Path) -> str | None:
+    notes_path = run_path / "notes.md"
+    if not notes_path.exists():
+        return None
+    return notes_path.read_text(encoding="utf-8")
 
 
 def _artifact_not_found(run_id: str, artifact_names: list[str]) -> HTTPException:
@@ -2164,27 +2677,69 @@ def _with_default_labels(labels_map: dict[str, str], n_states: int) -> dict[str,
     return out
 
 
-def _load_forecast_model_params(run_path: Path) -> dict[str, np.ndarray]:
+def _load_forecast_model_params_with_source(run_path: Path) -> tuple[dict[str, np.ndarray], str]:
     model_json_path = run_path / "model_params.json"
     if model_json_path.exists():
         try:
-            return _load_model_params_cached(model_json_path)
+            return _load_model_params_cached(model_json_path), "model_params.json"
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=f"Run {run_path.name} has malformed artifact: model_params.json ({exc})",
             ) from exc
-
     npz_path = run_path / "model_params.npz"
     if npz_path.exists():
         npz = np.load(npz_path)
-        return {
-            "transition_matrix": np.asarray(npz["transition_matrix"], dtype=np.float64),
-            "mu": np.asarray(npz["mu"], dtype=np.float64),
-            "sigma": np.asarray(npz["sigma"], dtype=np.float64),
-        }
-
+        return (
+            {
+                "transition_matrix": np.asarray(npz["transition_matrix"], dtype=np.float64),
+                "mu": np.asarray(npz["mu"], dtype=np.float64),
+                "sigma": np.asarray(npz["sigma"], dtype=np.float64),
+            },
+            "model_params.npz",
+        )
     raise _artifact_not_found(run_path.name, ["model_params.json", "model_params.npz"])
+
+
+def _load_forecast_model_params(run_path: Path) -> dict[str, np.ndarray]:
+    return _load_forecast_model_params_with_source(run_path)[0]
+
+
+def _stationary_distribution(transition_matrix: np.ndarray) -> np.ndarray:
+    n_states = int(transition_matrix.shape[0])
+    dist = np.ones(n_states, dtype=np.float64) / float(n_states)
+    for _ in range(5000):
+        updated = dist @ transition_matrix
+        if float(np.max(np.abs(updated - dist))) < 1e-12:
+            dist = updated
+            break
+        dist = updated
+    total = float(np.sum(dist))
+    if total <= 0.0:
+        return np.ones(n_states, dtype=np.float64) / float(n_states)
+    return dist / total
+
+
+def _stationary_payload(
+    transition_matrix: np.ndarray,
+    labels_map: dict[str, str],
+) -> dict[str, Any]:
+    stationary = _stationary_distribution(transition_matrix)
+    by_label = {
+        labels_map.get(str(i), f"regime_{i}"): float(stationary[i])
+        for i in range(stationary.shape[0])
+    }
+    implied_duration = {}
+    for i in range(stationary.shape[0]):
+        label = labels_map.get(str(i), f"regime_{i}")
+        stay_prob = float(transition_matrix[i, i])
+        denom = max(1.0 - stay_prob, 1e-12)
+        implied_duration[label] = float(1.0 / denom)
+    return {
+        "state_probs": [float(x) for x in stationary.tolist()],
+        "by_label": by_label,
+        "implied_durations_days": implied_duration,
+    }
 
 
 def _load_model_params_or_none(run_id: str, run_path: Path) -> dict[str, np.ndarray] | None:
@@ -2856,16 +3411,32 @@ def _version_fields() -> dict[str, Any]:
     }
 
 
-def _require_mutation_auth(request: Request) -> None:
+def _require_mutation_auth(
+    request: Request,
+    *,
+    endpoint: str,
+    run_id: str | None = None,
+    trash_id: str | None = None,
+    payload_summary: dict[str, Any] | None = None,
+) -> str:
     expected = os.getenv("REGIME_API_KEY")
     if not expected:
-        return
+        return "anonymous"
     provided = request.headers.get("X-API-Key")
     if provided != expected:
+        _append_global_mutation(
+            endpoint=endpoint,
+            actor="anonymous",
+            payload_summary=payload_summary,
+            run_id=run_id,
+            trash_id=trash_id,
+            status="denied_auth",
+        )
         raise HTTPException(
             status_code=401,
             detail="Missing or invalid X-API-Key for mutation endpoint",
         )
+    return "api_key"
 
 
 def _as_float_or_none(value: Any) -> float | None:

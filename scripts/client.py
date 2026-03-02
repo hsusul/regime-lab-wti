@@ -71,6 +71,10 @@ def purge_trash(trash_id: str, *, base_url: str = DEFAULT_BASE_URL) -> dict[str,
     return _request_json("DELETE", f"/runs/trash/{trash_id}", base_url=base_url)
 
 
+def delete_trash(trash_id: str, *, base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
+    return purge_trash(trash_id=trash_id, base_url=base_url)
+
+
 def get_notes(run_id: str, *, base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
     return _request_json("GET", f"/runs/{run_id}/notes", base_url=base_url)
 
@@ -88,19 +92,63 @@ def compare_runs(run_a: str, run_b: str, *, base_url: str = DEFAULT_BASE_URL) ->
     return _request_json("GET", f"/runs/{run_a}/compare/{run_b}", base_url=base_url)
 
 
+def download_bundle(
+    run_id: str,
+    *,
+    artifacts: str | None = None,
+    extras: str | None = None,
+    base_url: str = DEFAULT_BASE_URL,
+) -> bytes:
+    query_parts: list[str] = []
+    if artifacts:
+        query_parts.append(f"artifacts={artifacts}")
+    if extras:
+        query_parts.append(f"extras={extras}")
+    suffix = ("?" + "&".join(query_parts)) if query_parts else ""
+    with httpx.Client(base_url=base_url, timeout=60.0) as client:
+        response = client.get(f"/runs/{run_id}/bundle.zip{suffix}")
+        response.raise_for_status()
+        return response.content
+
+
 def evaluate_alerts(
     *,
     run_id: str | None = None,
     use_pinned: bool = False,
+    use_active: bool = False,
+    use_latest: bool = False,
     rules: dict[str, Any] | None = None,
     base_url: str = DEFAULT_BASE_URL,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {"use_pinned": bool(use_pinned)}
+    payload: dict[str, Any] = {
+        "use_pinned": bool(use_pinned),
+        "use_active": bool(use_active),
+        "use_latest": bool(use_latest),
+    }
     if run_id is not None:
         payload["run_id"] = run_id
     if rules is not None:
         payload["rules"] = rules
     return _request_json("POST", "/alerts/evaluate", base_url=base_url, payload=payload)
+
+
+def forecast_v3(
+    *,
+    run_id: str | None = None,
+    use_pinned: bool = False,
+    horizon: int = 10,
+    interval: float = 0.95,
+    include_stationary: bool = False,
+    base_url: str = DEFAULT_BASE_URL,
+) -> dict[str, Any]:
+    query = [f"horizon={int(horizon)}", f"interval={float(interval)}"]
+    if run_id is not None:
+        query.append(f"run_id={run_id}")
+    if use_pinned:
+        query.append("use_pinned=true")
+    if include_stationary:
+        query.append("include_stationary=true")
+    return _request_json("GET", f"/forecast_v3?{'&'.join(query)}", base_url=base_url)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -123,6 +171,16 @@ def _build_parser() -> argparse.ArgumentParser:
     artifact.add_argument("--name", required=True)
     artifact.add_argument("--out", default=None, help="Output path for artifact bytes")
 
+    bundle = sub.add_parser("bundle", help="GET /runs/{run_id}/bundle.zip")
+    bundle.add_argument("--run-id", required=True)
+    bundle.add_argument("--artifacts", default=None, help="Comma-separated artifact names")
+    bundle.add_argument(
+        "--extras",
+        default=None,
+        help="Comma-separated extras: report,openapi,run_info",
+    )
+    bundle.add_argument("--out", default=None, help="Output zip path")
+
     trash_list = sub.add_parser("trash_list", help="GET /runs/trash")
     trash_list.add_argument("--limit", type=int, default=25)
     trash_list.add_argument("--offset", type=int, default=0)
@@ -133,6 +191,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     trash_purge = sub.add_parser("trash_purge", help="DELETE /runs/trash/{trash_id}")
     trash_purge.add_argument("--trash-id", required=True)
+    trash_delete = sub.add_parser("trash_delete", help="DELETE /runs/trash/{trash_id}")
+    trash_delete.add_argument("--trash-id", required=True)
 
     notes_get = sub.add_parser("notes_get", help="GET /runs/{run_id}/notes")
     notes_get.add_argument("--run-id", required=True)
@@ -148,11 +208,24 @@ def _build_parser() -> argparse.ArgumentParser:
     alerts = sub.add_parser("alerts_evaluate", help="POST /alerts/evaluate")
     alerts.add_argument("--run-id", default=None)
     alerts.add_argument("--use-pinned", action="store_true")
+    alerts.add_argument("--use-active", action="store_true")
+    alerts.add_argument("--use-latest", action="store_true")
+    alerts.add_argument("--shock-threshold", type=float, default=None)
+    alerts.add_argument("--transition-entropy-threshold", type=float, default=None)
+    alerts.add_argument("--coverage-threshold", type=float, default=None)
+    alerts.add_argument("--transition-prob-threshold", type=float, default=None)
     alerts.add_argument(
         "--rules-json",
         default=None,
         help="Optional JSON object string for rules",
     )
+
+    forecast = sub.add_parser("forecast_v3", help="GET /forecast_v3")
+    forecast.add_argument("--run-id", default=None)
+    forecast.add_argument("--use-pinned", action="store_true")
+    forecast.add_argument("--horizon", type=int, default=10)
+    forecast.add_argument("--interval", type=float, default=0.95)
+    forecast.add_argument("--include-stationary", action="store_true")
 
     return parser
 
@@ -190,6 +263,17 @@ def main() -> None:
         path.write_bytes(data)
         print(path)
         return
+    if args.command == "bundle":
+        data = download_bundle(
+            run_id=str(args.run_id),
+            artifacts=args.artifacts,
+            extras=args.extras,
+            base_url=base_url,
+        )
+        out_path = Path(args.out) if args.out else Path(f"{args.run_id}_bundle.zip")
+        out_path.write_bytes(data)
+        print(out_path)
+        return
     if args.command == "trash_list":
         print(
             json.dumps(
@@ -208,6 +292,9 @@ def main() -> None:
         return
     if args.command == "trash_purge":
         print(json.dumps(purge_trash(trash_id=str(args.trash_id), base_url=base_url), indent=2))
+        return
+    if args.command == "trash_delete":
+        print(json.dumps(delete_trash(trash_id=str(args.trash_id), base_url=base_url), indent=2))
         return
     if args.command == "notes_get":
         print(json.dumps(get_notes(run_id=str(args.run_id), base_url=base_url), indent=2))
@@ -229,15 +316,45 @@ def main() -> None:
         )
         return
     if args.command == "alerts_evaluate":
-        rules = None
+        rules: dict[str, Any] | None = None
         if args.rules_json:
             rules = json.loads(str(args.rules_json))
+        rule_overrides: dict[str, Any] = {}
+        if args.shock_threshold is not None:
+            rule_overrides["shock_occupancy_threshold"] = float(args.shock_threshold)
+        if args.transition_entropy_threshold is not None:
+            rule_overrides["transition_entropy_jump_threshold"] = float(
+                args.transition_entropy_threshold
+            )
+        if args.coverage_threshold is not None:
+            rule_overrides["coverage_threshold"] = float(args.coverage_threshold)
+        if args.transition_prob_threshold is not None:
+            rule_overrides["transition_prob_threshold"] = float(args.transition_prob_threshold)
+        if rule_overrides:
+            rules = {**(rules or {}), **rule_overrides}
         print(
             json.dumps(
                 evaluate_alerts(
                     run_id=args.run_id,
                     use_pinned=bool(args.use_pinned),
+                    use_active=bool(args.use_active),
+                    use_latest=bool(args.use_latest),
                     rules=rules,
+                    base_url=base_url,
+                ),
+                indent=2,
+            )
+        )
+        return
+    if args.command == "forecast_v3":
+        print(
+            json.dumps(
+                forecast_v3(
+                    run_id=args.run_id,
+                    use_pinned=bool(args.use_pinned),
+                    horizon=int(args.horizon),
+                    interval=float(args.interval),
+                    include_stationary=bool(args.include_stationary),
                     base_url=base_url,
                 ),
                 indent=2,

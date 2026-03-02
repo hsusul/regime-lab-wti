@@ -112,17 +112,27 @@ By default, the HTML is saved to `runs/<run_id>/regimes.html`.
 
 - `POST /fit` -> train a model run, return `run_id`
 - `GET /health` -> health check
+- `GET /ready` -> release-readiness snapshot (works with no runs)
 - `GET /runs` -> list run ids (newest first)
+- `GET /runs/trash` -> list trash entries
+- `GET /runs/trash/{trash_id}` -> inspect one trash entry
+- `DELETE /runs/trash/{trash_id}` -> hard-purge trash entry
 - `GET /runs/latest/summary` -> latest run summary
 - `GET /runs/{run_id}/artifacts/{name}` -> download raw artifact bytes
 - `GET /runs/{run_id}/scorecard` -> compact run quality/diagnostics summary
 - `GET /runs/{run_id}/integrity` -> verify artifact hashes from manifest
-- `GET /runs/{run_id}/bundle.zip` -> download selected/all run artifacts as zip
+- `GET /runs/{run_id}/bundle.zip` -> download selected/all run artifacts as zip (always includes generated `integrity.json`; extras via `extras=report,openapi,run_info`)
+- `GET /runs/{run_id}/notes` -> read `notes.md`
+- `PUT /runs/{run_id}/notes` -> write `notes.md`
+- `GET /runs/{run_id}/mutations` -> per-run mutation log
+- `GET /runs/{run_id}/compare/{other_run_id}` -> compare + drift + tag/note hints
 - `GET /predict_proba` -> dates, returns, per-regime probabilities
 - `GET /transition_matrix` -> learned transition matrix
 - `GET /regime_summary` -> regime stats, durations, transition counts
 - `GET /forecast` -> multi-step predictive mean + uncertainty interval
+- `GET /forecast_v3` -> additive forecast schema (label probs, raw probs, intervals, optional stationary payload)
 - `POST /predict_current` -> latest/current regime label and state
+- `POST /alerts/evaluate` -> artifact-first alert evaluation for selected run
 
 ## How to use the API
 
@@ -168,15 +178,73 @@ Open [http://localhost:8000/ui](http://localhost:8000/ui).
   - `POST /runs/{run_id}/pin`
   - `POST /runs/unpin`
   - `GET /runs/active`
+- Trash/delete/restore:
+  - `DELETE /runs/{run_id}`
+  - `GET /runs/trash`
+  - `GET /runs/trash/{trash_id}`
+  - `POST /runs/trash/{trash_id}/restore`
+  - `DELETE /runs/trash/{trash_id}`
 - Freeze/unfreeze run directory writes:
   - `POST /runs/{run_id}/freeze`
   - `POST /runs/{run_id}/unfreeze`
 - Attach tags/notes metadata:
   - `PUT /runs/{run_id}/tags`
   - `GET /runs/{run_id}/tags`
+  - `PUT /runs/{run_id}/notes`
+  - `GET /runs/{run_id}/notes`
+  - `GET /runs/{run_id}/mutations`
 - Integrity + bundle:
   - `GET /runs/{run_id}/integrity`
   - `GET /runs/{run_id}/bundle.zip?artifacts=manifest.json,regimes.html`
+  - `GET /runs/{run_id}/bundle.zip?extras=report,openapi,run_info`
+
+## Versioning
+
+- `GET /version` returns:
+  - `api_version`
+  - `schema_version`
+  - `git_commit_hash`
+  - `built_at_utc`
+
+## API Key Auth
+
+Set `REGIME_API_KEY` to protect mutation endpoints. When set, requests must include:
+
+- Header: `X-API-Key: <your-key>`
+
+Protected mutations include pin/unpin, tags update, freeze/unfreeze, run delete, and trash restore.
+
+## Trash/Delete/Restore
+
+- Soft delete a run:
+  - `DELETE /runs/{run_id}`
+  - Moves the run to `runs/_trash/` and does not hard-delete data.
+- Restore from trash:
+  - `POST /runs/trash/{trash_id}/restore`
+
+## Forecast Eval
+
+- Training writes `forecast_eval.json` per run with rolling horizon metrics (1..5):
+  - MAE
+  - interval coverage
+- Endpoints:
+  - `GET /runs/{run_id}/forecast_eval`
+  - `GET /runs/latest/forecast_eval`
+
+## Drift
+
+- Compare run drift:
+  - `POST /runs/drift` with `{"run_a":"run_x","run_b":"run_y"}`
+- Includes deltas for likelihood/entropy/shock occupancy plus occupancy KL divergence and event summary deltas.
+- Pair compare endpoint:
+  - `GET /runs/{run_id}/compare/{other_run_id}`
+
+## Reports
+
+- Per-run markdown report:
+  - `GET /runs/{run_id}/report.md`
+  - `GET /runs/latest/report.md`
+- If missing, report is generated from artifacts; for non-frozen runs it is also saved to `report.md`.
 
 ## Python Client
 
@@ -186,6 +254,33 @@ Small helper client:
 python -m scripts.client list_runs
 python -m scripts.client latest
 python -m scripts.client predict_current --include-probs
+python -m scripts.client forecast_v3 --run-id <RUN_ID> --include-stationary
+python -m scripts.client alerts_evaluate --run-id <RUN_ID> --shock-threshold 0.2
+python -m scripts.client bundle --run-id <RUN_ID> --extras report,openapi,run_info
+python -m scripts.client notes_put --run-id <RUN_ID> --content "release notes"
+```
+
+## Docker
+
+Build and run with Docker:
+
+```bash
+docker build -t regime-lab-wti .
+docker run --rm -p 8000:8000 -v "$(pwd)/runs:/app/runs" regime-lab-wti
+```
+
+Or with compose:
+
+```bash
+docker compose up --build
+```
+
+## Trash retention CLI
+
+Purge old trash entries:
+
+```bash
+python -m scripts.purge_trash --days 14
 ```
 
 ### Example `curl` calls

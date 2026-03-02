@@ -6,6 +6,7 @@ import json
 import random
 import subprocess
 import hashlib
+from statistics import NormalDist
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from models.infer import (
     build_regime_summary,
     forecast_predictive_distribution,
     forward_filter_probs,
+    probability_weighted_moments,
     predict_proba_payload,
 )
 from models.provenance import write_manifest_with_provenance
@@ -289,6 +291,80 @@ def _event_classifier_summary(events_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_forecast_eval_payload(
+    run_id: str,
+    created_at_utc: str,
+    returns: np.ndarray,
+    filter_probs: np.ndarray,
+    transition_matrix: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    interval: float,
+    window: int = 120,
+    max_horizon: int = 5,
+) -> dict[str, Any]:
+    """Build rolling forecast evaluation metrics from in-memory artifacts."""
+    obs = np.asarray(returns, dtype=np.float64)
+    probs = np.asarray(filter_probs, dtype=np.float64)
+    a_mat = np.asarray(transition_matrix, dtype=np.float64)
+    mu_arr = np.asarray(mu, dtype=np.float64)
+    sigma_arr = np.asarray(sigma, dtype=np.float64)
+
+    z = NormalDist().inv_cdf(0.5 + 0.5 * float(interval))
+    horizon_rows: list[dict[str, Any]] = []
+
+    n_obs = int(obs.shape[0])
+    for horizon in range(1, max_horizon + 1):
+        if n_obs <= horizon:
+            horizon_rows.append(
+                {
+                    "horizon": int(horizon),
+                    "n_samples": 0,
+                    "mae": None,
+                    "coverage": None,
+                }
+            )
+            continue
+
+        origin_end = n_obs - horizon
+        origin_start = max(0, origin_end - int(window))
+        abs_errors: list[float] = []
+        coverages: list[float] = []
+
+        for t in range(origin_start, origin_end):
+            state_probs = np.asarray(probs[t], dtype=np.float64)
+            for _ in range(horizon):
+                state_probs = state_probs @ a_mat
+
+            exp_return, exp_vol = probability_weighted_moments(
+                state_probs=state_probs,
+                mu=mu_arr,
+                sigma=sigma_arr,
+            )
+            realized = float(obs[t + horizon])
+            abs_errors.append(abs(realized - exp_return))
+            lower = exp_return - z * exp_vol
+            upper = exp_return + z * exp_vol
+            coverages.append(1.0 if lower <= realized <= upper else 0.0)
+
+        horizon_rows.append(
+            {
+                "horizon": int(horizon),
+                "n_samples": int(len(abs_errors)),
+                "mae": (float(np.mean(abs_errors)) if abs_errors else None),
+                "coverage": (float(np.mean(coverages)) if coverages else None),
+            }
+        )
+
+    return {
+        "run_id": run_id,
+        "created_at_utc": created_at_utc,
+        "window": int(window),
+        "interval": float(interval),
+        "horizons": horizon_rows,
+    }
+
+
 def resolve_run_dir(run_id: Optional[str], runs_root: str | Path = "runs") -> Path:
     root = Path(runs_root)
     if run_id:
@@ -465,6 +541,18 @@ def train_model_run(
         states=viterbi_states,
         labels_map=regime_labels,
     )
+    forecast_eval_payload = _build_forecast_eval_payload(
+        run_id=run_id_final,
+        created_at_utc=run_created_at,
+        returns=returns,
+        filter_probs=filter_probs,
+        transition_matrix=params["transition_matrix"],
+        mu=params["mu"],
+        sigma=params["sigma"],
+        interval=float(cfg.forecast.get("interval", 0.95)),
+        window=120,
+        max_horizon=5,
+    )
 
     metrics_payload = {
         "train_log_likelihood": train_ll,
@@ -530,6 +618,7 @@ def train_model_run(
         "viterbi_states.json",
         "events.json",
         "forecast_default.json",
+        "forecast_eval.json",
         "manifest.json",
     ]
 
@@ -558,6 +647,7 @@ def train_model_run(
     _write_json(run_path / "viterbi_states.json", viterbi_payload)
     _write_json(run_path / "events.json", events_payload)
     _write_json(run_path / "forecast_default.json", default_forecast)
+    _write_json(run_path / "forecast_eval.json", forecast_eval_payload)
     write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest_payload)
 
     (run_root / "latest_run.txt").write_text(run_id_final, encoding="utf-8")
