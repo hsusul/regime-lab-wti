@@ -175,6 +175,55 @@ def _viterbi_segment_stats(states: np.ndarray) -> dict[str, float | int | None]:
     }
 
 
+def _build_events_payload(
+    run_id: str,
+    dates: list[str],
+    returns: np.ndarray,
+    states: np.ndarray,
+    labels_map: dict[str, str],
+) -> dict[str, Any]:
+    if len(dates) != states.shape[0] or returns.shape[0] != states.shape[0]:
+        raise ValueError("Events payload inputs must align on length.")
+    if states.shape[0] == 0:
+        return {"run_id": run_id, "n_events": 0, "events": []}
+
+    seq_states = states.astype(np.int64)
+    seq_returns = returns.astype(np.float64)
+    events: list[dict[str, Any]] = []
+    start_idx = 0
+    current = int(seq_states[0])
+
+    for idx in range(1, seq_states.shape[0]):
+        state_i = int(seq_states[idx])
+        if state_i != current:
+            end_idx = idx - 1
+            events.append(
+                {
+                    "state": int(current),
+                    "label": labels_map.get(str(current), f"regime_{current}"),
+                    "start_date": str(dates[start_idx]),
+                    "end_date": str(dates[end_idx]),
+                    "length": int(end_idx - start_idx + 1),
+                    "cumulative_log_return": float(np.sum(seq_returns[start_idx : end_idx + 1])),
+                }
+            )
+            start_idx = idx
+            current = state_i
+
+    end_idx = seq_states.shape[0] - 1
+    events.append(
+        {
+            "state": int(current),
+            "label": labels_map.get(str(current), f"regime_{current}"),
+            "start_date": str(dates[start_idx]),
+            "end_date": str(dates[end_idx]),
+            "length": int(end_idx - start_idx + 1),
+            "cumulative_log_return": float(np.sum(seq_returns[start_idx : end_idx + 1])),
+        }
+    )
+    return {"run_id": run_id, "n_events": int(len(events)), "events": events}
+
+
 def resolve_run_dir(run_id: Optional[str], runs_root: str | Path = "runs") -> Path:
     root = Path(runs_root)
     if run_id:
@@ -344,6 +393,13 @@ def train_model_run(
     run_path.mkdir(parents=True, exist_ok=True)
 
     run_created_at = datetime.now(timezone.utc).isoformat()
+    events_payload = _build_events_payload(
+        run_id=run_id_final,
+        dates=dates,
+        returns=returns,
+        states=viterbi_states,
+        labels_map=regime_labels,
+    )
 
     metrics_payload = {
         "train_log_likelihood": train_ll,
@@ -404,6 +460,7 @@ def train_model_run(
         "regime_summary.json",
         "predict_proba.json",
         "viterbi_states.json",
+        "events.json",
         "forecast_default.json",
         "manifest.json",
     ]
@@ -431,6 +488,7 @@ def train_model_run(
     _write_json(run_path / "regime_summary.json", regime_summary)
     _write_json(run_path / "predict_proba.json", predict_payload)
     _write_json(run_path / "viterbi_states.json", viterbi_payload)
+    _write_json(run_path / "events.json", events_payload)
     _write_json(run_path / "forecast_default.json", default_forecast)
     _write_json(run_path / "manifest.json", manifest_payload)
 

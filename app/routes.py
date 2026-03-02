@@ -38,6 +38,12 @@ class PredictCurrentRequest(BaseModel):
     run_id: Optional[str] = Field(default=None)
 
 
+class CompareRunsRequest(BaseModel):
+    """Request payload for comparing multiple run artifacts."""
+
+    run_ids: list[str] = Field(default_factory=list)
+
+
 @router.post("/fit")
 def fit_model(request: FitRequest) -> dict[str, Any]:
     """Train model and persist artifacts under runs/<run_id>/."""
@@ -62,6 +68,14 @@ def list_runs() -> dict[str, Any]:
     return {"runs": _list_run_ids()}
 
 
+@router.get("/runs/active")
+def active_run() -> dict[str, str]:
+    """Resolve active run: pinned when available, otherwise latest."""
+    run_id = _read_pinned_run_id_or_none() or _latest_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return {"run_id": run_id, "run_dir": str(run_path)}
+
+
 @router.get("/runs/pinned")
 def pinned_run() -> dict[str, str]:
     """Return the currently pinned run id and path."""
@@ -80,6 +94,16 @@ def pin_run(run_id: str) -> dict[str, str]:
 
     _pinned_run_file().write_text(run_id, encoding="utf-8")
     return {"pinned_run_id": run_id}
+
+
+@router.post("/runs/unpin")
+def unpin_run() -> dict[str, bool]:
+    """Remove pinned run pointer if present."""
+    pinned_path = _pinned_run_file()
+    if not pinned_path.exists():
+        return {"unpinned": False}
+    pinned_path.unlink()
+    return {"unpinned": True}
 
 
 @router.get("/runs/latest")
@@ -106,6 +130,14 @@ def latest_run_evaluation() -> dict[str, Any]:
     return _read_json(run_path / "evaluation.json", run_id=run_id)
 
 
+@router.get("/runs/latest/events")
+def latest_run_events() -> dict[str, Any]:
+    """Return regime events for latest run."""
+    run_id = _latest_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return _load_or_build_events(run_path=run_path)
+
+
 @router.get("/runs/latest/plot")
 def latest_run_plot_path() -> dict[str, str]:
     """Return plot path for latest run."""
@@ -129,6 +161,13 @@ def run_evaluation(run_id: str) -> dict[str, Any]:
     """Return evaluation artifact for a specific run id."""
     run_path = _resolve_run_path(run_id)
     return _read_json(run_path / "evaluation.json", run_id=run_id)
+
+
+@router.get("/runs/{run_id}/events")
+def run_events(run_id: str) -> dict[str, Any]:
+    """Return regime events artifact for a run."""
+    run_path = _resolve_run_path(run_id)
+    return _load_or_build_events(run_path=run_path)
 
 
 @router.get("/runs/{run_id}/plot")
@@ -174,6 +213,66 @@ def run_model(run_id: str) -> dict[str, Any]:
     return _read_json(run_path / "model_params.json", run_id=run_id)
 
 
+@router.post("/runs/compare")
+def compare_runs(request: CompareRunsRequest) -> dict[str, Any]:
+    """Compare run artifacts using persisted summary/evaluation data."""
+    run_ids = request.run_ids
+    if not run_ids:
+        raise HTTPException(status_code=400, detail="run_ids must contain at least one run id")
+
+    rows: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        run_path = _resolve_run_path(run_id)
+        evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
+        summary = _read_json(run_path / "regime_summary.json", run_id=run_id)
+        transition = _read_json(run_path / "transition_matrix.json", run_id=run_id)
+
+        metrics = evaluation.get("metrics", {})
+        rows.append(
+            {
+                "run_id": run_id,
+                "metrics": {
+                    "best_val_ll": metrics.get("best_val_log_likelihood"),
+                    "test_avg_ll": metrics.get("test_avg_log_likelihood"),
+                },
+                "evaluation": evaluation,
+                "summary": summary,
+                "transition": transition,
+            }
+        )
+
+    response: dict[str, Any] = {"runs": rows}
+    if len(rows) == 2:
+        first = rows[0]
+        second = rows[1]
+        first_best = _as_float_or_none(first["metrics"].get("best_val_ll"))
+        second_best = _as_float_or_none(second["metrics"].get("best_val_ll"))
+
+        first_ent = _as_float_or_none(
+            first["evaluation"].get("regime_diagnostics", {}).get("transition_entropy")
+        )
+        second_ent = _as_float_or_none(
+            second["evaluation"].get("regime_diagnostics", {}).get("transition_entropy")
+        )
+
+        first_shock = _shock_occupancy(first["summary"])
+        second_shock = _shock_occupancy(second["summary"])
+
+        response["diffs"] = {
+            "delta_best_val_ll": (
+                None if first_best is None or second_best is None else float(second_best - first_best)
+            ),
+            "delta_transition_entropy": (
+                None if first_ent is None or second_ent is None else float(second_ent - first_ent)
+            ),
+            "delta_shock_occupancy": (
+                None if first_shock is None or second_shock is None else float(second_shock - first_shock)
+            ),
+        }
+
+    return response
+
+
 @router.get("/ui")
 def ui_page() -> HTMLResponse:
     """Simple demo UI for browsing runs and regime outputs."""
@@ -198,6 +297,7 @@ def ui_page() -> HTMLResponse:
 </head>
 <body>
   <h1>{title}</h1>
+  <div id="activeInfo"><strong>Active run:</strong> N/A</div>
   <div id="pinnedInfo"><strong>Pinned run:</strong> none</div>
   <div id="status">Loading runs...</div>
   <div class="row">
@@ -205,6 +305,7 @@ def ui_page() -> HTMLResponse:
     <select id="runSelect"></select>
     <button id="refreshBtn" type="button">Refresh</button>
     <button id="pinBtn" type="button">Pin this run</button>
+    <button id="unpinBtn" type="button" style="display:none;">Unpin</button>
   </div>
   <div class="box">
     <div id="currentRegime">Current regime: N/A</div>
@@ -220,7 +321,9 @@ def ui_page() -> HTMLResponse:
     const runSelect = document.getElementById("runSelect");
     const refreshBtn = document.getElementById("refreshBtn");
     const pinBtn = document.getElementById("pinBtn");
+    const unpinBtn = document.getElementById("unpinBtn");
     const statusEl = document.getElementById("status");
+    const activeInfoEl = document.getElementById("activeInfo");
     const pinnedInfoEl = document.getElementById("pinnedInfo");
     const currentRegimeEl = document.getElementById("currentRegime");
     const currentMetaEl = document.getElementById("currentMeta");
@@ -237,12 +340,23 @@ def ui_page() -> HTMLResponse:
       return data;
     }}
 
+    async function loadActive() {{
+      try {{
+        const active = await fetchJson("/runs/active");
+        activeInfoEl.innerHTML = "<strong>Active run:</strong> " + active.run_id;
+      }} catch (err) {{
+        activeInfoEl.innerHTML = "<strong>Active run:</strong> N/A";
+      }}
+    }}
+
     async function loadPinned() {{
       try {{
         const pinned = await fetchJson("/runs/pinned");
         pinnedInfoEl.innerHTML = "<strong>Pinned run:</strong> " + pinned.run_id;
+        unpinBtn.style.display = "inline-block";
       }} catch (err) {{
         pinnedInfoEl.innerHTML = "<strong>Pinned run:</strong> none";
+        unpinBtn.style.display = "none";
       }}
     }}
 
@@ -290,6 +404,7 @@ def ui_page() -> HTMLResponse:
       try {{
         const payload = await fetchJson("/runs");
         const runs = Array.isArray(payload.runs) ? payload.runs : [];
+        await loadActive();
         await loadPinned();
         runSelect.innerHTML = "";
         if (runs.length === 0) {{
@@ -327,10 +442,21 @@ def ui_page() -> HTMLResponse:
         await fetchJson("/runs/" + encodeURIComponent(runId) + "/pin", {{
           method: "POST"
         }});
+        await loadActive();
         await loadPinned();
         statusEl.textContent = "Pinned run " + runId;
       }} catch (err) {{
         statusEl.textContent = "Error pinning run: " + err.message;
+      }}
+    }});
+    unpinBtn.addEventListener("click", async () => {{
+      try {{
+        const resp = await fetchJson("/runs/unpin", {{ method: "POST" }});
+        await loadActive();
+        await loadPinned();
+        statusEl.textContent = resp.unpinned ? "Unpinned active run" : "No pinned run to remove";
+      }} catch (err) {{
+        statusEl.textContent = "Error unpinning run: " + err.message;
       }}
     }});
     refreshBtn.addEventListener("click", refreshRuns);
@@ -621,27 +747,37 @@ def _validate_run_id_for_pin(run_id: str) -> None:
 
 
 def _read_pinned_run_id_or_404() -> str:
-    pinned_path = _pinned_run_file()
-    if not pinned_path.exists():
+    pinned_run_id = _read_pinned_run_id_or_none()
+    if pinned_run_id is None:
+        pinned_path = _pinned_run_file()
+        if not pinned_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Pinned run file not found: {PINNED_RUN_FILENAME}",
+            )
         raise HTTPException(
             status_code=404,
-            detail=f"Pinned run file not found: {PINNED_RUN_FILENAME}",
+            detail=f"Pinned run file is empty or invalid: {PINNED_RUN_FILENAME}",
         )
+    return pinned_run_id
+
+
+def _read_pinned_run_id_or_none() -> str | None:
+    pinned_path = _pinned_run_file()
+    if not pinned_path.exists():
+        return None
 
     pinned_run_id = pinned_path.read_text(encoding="utf-8").strip()
     if not pinned_run_id:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Pinned run file is empty: {PINNED_RUN_FILENAME}",
-        )
+        return None
 
-    _validate_run_id_for_pin(pinned_run_id)
+    try:
+        _validate_run_id_for_pin(pinned_run_id)
+    except HTTPException:
+        return None
     run_path = RUNS_ROOT / pinned_run_id
     if not run_path.exists() or not run_path.is_dir():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Pinned run directory not found: {pinned_run_id}",
-        )
+        return None
     return pinned_run_id
 
 
@@ -795,3 +931,131 @@ def _read_json(path: Path, run_id: str | None = None) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Artifact not found: {path.name}")
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _load_or_build_events(run_path: Path) -> dict[str, Any]:
+    run_id = run_path.name
+    events_path = run_path / "events.json"
+    if events_path.exists():
+        return _read_json(events_path, run_id=run_id)
+
+    missing: list[str] = []
+    viterbi_path = run_path / "viterbi_states.json"
+    predict_path = run_path / "predict_proba.json"
+    if not viterbi_path.exists():
+        missing.append(viterbi_path.name)
+    if not predict_path.exists():
+        missing.append(predict_path.name)
+    if missing:
+        raise _artifact_not_found(run_id, missing)
+
+    viterbi = _read_json(viterbi_path, run_id=run_id)
+    predict = _read_json(predict_path, run_id=run_id)
+    labels_map = _read_label_mapping(run_path)
+
+    events_payload = _build_events_payload(
+        run_id=run_id,
+        dates=viterbi.get("dates", []),
+        states=viterbi.get("states", []),
+        returns=predict.get("returns", []),
+        labels_map=labels_map,
+    )
+    with events_path.open("w", encoding="utf-8") as f:
+        json.dump(events_payload, f, indent=2)
+
+    manifest_path = run_path / "manifest.json"
+    if manifest_path.exists():
+        manifest = _read_json(manifest_path, run_id=run_id)
+        artifacts = manifest.get("artifacts", [])
+        if isinstance(artifacts, list) and "events.json" not in artifacts:
+            artifacts.append("events.json")
+            manifest["artifacts"] = artifacts
+            with manifest_path.open("w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+
+    return events_payload
+
+
+def _build_events_payload(
+    run_id: str,
+    dates: list[Any],
+    states: list[Any],
+    returns: list[Any],
+    labels_map: dict[str, str],
+) -> dict[str, Any]:
+    if len(dates) == 0 or len(states) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has empty artifact content for events generation",
+        )
+    if len(dates) != len(states):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has malformed artifact: viterbi_states.json",
+        )
+    if len(returns) != len(states):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} has malformed artifact: predict_proba.json",
+        )
+
+    seq_states = [int(s) for s in states]
+    seq_returns = [float(r) for r in returns]
+    segments: list[dict[str, Any]] = []
+    start_idx = 0
+    current_state = seq_states[0]
+
+    for idx in range(1, len(seq_states)):
+        if seq_states[idx] != current_state:
+            end_idx = idx - 1
+            cumulative_log_return = float(np.sum(seq_returns[start_idx : end_idx + 1]))
+            segments.append(
+                {
+                    "state": int(current_state),
+                    "label": labels_map.get(str(current_state), f"regime_{current_state}"),
+                    "start_date": str(dates[start_idx]),
+                    "end_date": str(dates[end_idx]),
+                    "length": int(end_idx - start_idx + 1),
+                    "cumulative_log_return": cumulative_log_return,
+                }
+            )
+            start_idx = idx
+            current_state = seq_states[idx]
+
+    end_idx = len(seq_states) - 1
+    cumulative_log_return = float(np.sum(seq_returns[start_idx : end_idx + 1]))
+    segments.append(
+        {
+            "state": int(current_state),
+            "label": labels_map.get(str(current_state), f"regime_{current_state}"),
+            "start_date": str(dates[start_idx]),
+            "end_date": str(dates[end_idx]),
+            "length": int(end_idx - start_idx + 1),
+            "cumulative_log_return": cumulative_log_return,
+        }
+    )
+
+    return {
+        "run_id": run_id,
+        "n_events": int(len(segments)),
+        "events": segments,
+    }
+
+
+def _as_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _shock_occupancy(summary: dict[str, Any]) -> float | None:
+    regimes = summary.get("regimes", [])
+    if not isinstance(regimes, list):
+        return None
+    for row in regimes:
+        if str(row.get("label")) == "shock":
+            return _as_float_or_none(row.get("avg_posterior_probability"))
+    return None
