@@ -50,6 +50,32 @@ def test_latest_summary_endpoint(monkeypatch, tmp_path: Path) -> None:
     assert response.json()["n_observations"] == 123
 
 
+def test_pinned_run_endpoints(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_id = "run_20250101T000000Z_pinned111"
+    (runs_root / run_id).mkdir()
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    missing_resp = client.get("/runs/pinned")
+    assert missing_resp.status_code == 404
+    assert "pinned_run.txt" in missing_resp.json()["detail"]
+
+    pin_resp = client.post(f"/runs/{run_id}/pin")
+    assert pin_resp.status_code == 200
+    assert pin_resp.json()["pinned_run_id"] == run_id
+
+    pinned_resp = client.get("/runs/pinned")
+    assert pinned_resp.status_code == 200
+    assert pinned_resp.json()["run_id"] == run_id
+    assert pinned_resp.json()["run_dir"].endswith(run_id)
+
+    invalid_resp = client.post("/runs/not_a_run_id/pin")
+    assert invalid_resp.status_code == 404
+
+
 def test_latest_run_endpoint(monkeypatch, tmp_path: Path) -> None:
     runs_root = tmp_path / "runs"
     runs_root.mkdir(parents=True, exist_ok=True)
@@ -114,6 +140,47 @@ def test_run_model_endpoint(monkeypatch, tmp_path: Path) -> None:
     response = client.get(f"/runs/{run_id}/model")
     assert response.status_code == 200
     assert response.json() == model_payload
+
+
+def test_evaluation_endpoints(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_id = "run_20260110T000000Z_eval"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "created_at_utc": "2026-03-01T00:00:00+00:00",
+        "n_obs": 100,
+        "n_states": 3,
+        "metrics": {
+            "best_val_log_likelihood": 1.23,
+            "test_avg_log_likelihood": 0.45,
+        },
+        "regime_diagnostics": {
+            "implied_avg_duration_days": [10.0, 5.0, 2.0],
+            "transition_entropy": 0.9,
+            "regimes": [],
+            "viterbi_segment_stats": {
+                "segment_count": 5,
+                "mean_duration": 20.0,
+                "max_duration": 31,
+            },
+        },
+    }
+    (run_dir / "evaluation.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    by_id = client.get(f"/runs/{run_id}/evaluation")
+    assert by_id.status_code == 200
+    assert by_id.json()["run_id"] == run_id
+    assert "regime_diagnostics" in by_id.json()
+
+    latest = client.get("/runs/latest/evaluation")
+    assert latest.status_code == 200
+    assert latest.json()["run_id"] == run_id
 
 
 def test_predict_current_prefers_viterbi_and_falls_back(monkeypatch, tmp_path: Path) -> None:
@@ -189,6 +256,7 @@ def test_ui_page_loads(monkeypatch, tmp_path: Path) -> None:
     assert response.status_code == 200
     assert "WTI Regime Monitor" in response.text
     assert "Current regime" in response.text
+    assert "Pin this run" in response.text
 
 
 def test_run_artifacts_endpoint(monkeypatch, tmp_path: Path) -> None:
@@ -278,3 +346,86 @@ def test_predict_current_include_probs(monkeypatch, tmp_path: Path) -> None:
     assert payload["label_mapping"]["0"] == "low_vol"
     assert isinstance(payload["expected_return"], float)
     assert isinstance(payload["expected_vol"], float)
+
+
+def test_forecast_v2_endpoint(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_id = "run_20260115T000000Z_fcastv2"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    (run_dir / "model_params.json").write_text(
+        json.dumps(
+            {
+                "n_states": 3,
+                "initial_probs": [0.3, 0.4, 0.3],
+                "transition_matrix": [
+                    [0.9, 0.08, 0.02],
+                    [0.1, 0.8, 0.1],
+                    [0.2, 0.2, 0.6],
+                ],
+                "mu": [0.001, 0.0, -0.01],
+                "sigma": [0.01, 0.015, 0.04],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "regime_labels.json").write_text(
+        json.dumps({"label_mapping": {"0": "low_vol", "1": "mid_vol", "2": "shock"}}),
+        encoding="utf-8",
+    )
+    (run_dir / "predict_proba.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-01-14", "2026-01-15"],
+                "returns": [0.01, -0.02],
+                "regime_probabilities": [[0.2, 0.3, 0.5], [0.1, 0.7, 0.2]],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    resp = client.get(f"/forecast_v2?run_id={run_id}&horizon=4")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["run_id"] == run_id
+    assert payload["horizon"] == 4
+    assert len(payload["forecast"]) == 4
+    first = payload["forecast"][0]
+    assert "state_probs" in first
+    assert "expected_return" in first
+    assert "expected_vol" in first
+    assert "expected_price_index" in first
+
+    pin_resp = client.post(f"/runs/{run_id}/pin")
+    assert pin_resp.status_code == 200
+    pinned_forecast = client.get("/forecast_v2?use_pinned=true&horizon=2")
+    assert pinned_forecast.status_code == 200
+    assert pinned_forecast.json()["run_id"] == run_id
+
+    missing_run_id = "run_20260116T000000Z_missing"
+    missing_dir = runs_root / missing_run_id
+    missing_dir.mkdir(parents=True, exist_ok=True)
+    (missing_dir / "model_params.json").write_text(
+        json.dumps(
+            {
+                "n_states": 3,
+                "initial_probs": [0.3, 0.4, 0.3],
+                "transition_matrix": [
+                    [0.9, 0.08, 0.02],
+                    [0.1, 0.8, 0.1],
+                    [0.2, 0.2, 0.6],
+                ],
+                "mu": [0.001, 0.0, -0.01],
+                "sigma": [0.01, 0.015, 0.04],
+            }
+        ),
+        encoding="utf-8",
+    )
+    missing_resp = client.get(f"/forecast_v2?run_id={missing_run_id}&horizon=2")
+    assert missing_resp.status_code == 404
+    assert "predict_proba.json" in missing_resp.json()["detail"]

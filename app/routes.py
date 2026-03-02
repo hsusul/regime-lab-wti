@@ -21,6 +21,7 @@ from models.train import resolve_run_dir, train_model_run
 
 router = APIRouter()
 RUNS_ROOT = Path("runs")
+PINNED_RUN_FILENAME = "pinned_run.txt"
 
 
 class FitRequest(BaseModel):
@@ -61,6 +62,26 @@ def list_runs() -> dict[str, Any]:
     return {"runs": _list_run_ids()}
 
 
+@router.get("/runs/pinned")
+def pinned_run() -> dict[str, str]:
+    """Return the currently pinned run id and path."""
+    run_id = _read_pinned_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return {"run_id": run_id, "run_dir": str(run_path)}
+
+
+@router.post("/runs/{run_id}/pin")
+def pin_run(run_id: str) -> dict[str, str]:
+    """Pin a specific run id for production-style workflows."""
+    _validate_run_id_for_pin(run_id)
+    run_path = RUNS_ROOT / run_id
+    if not run_path.exists() or not run_path.is_dir():
+        raise HTTPException(status_code=404, detail=f"Run not found for pinning: {run_id}")
+
+    _pinned_run_file().write_text(run_id, encoding="utf-8")
+    return {"pinned_run_id": run_id}
+
+
 @router.get("/runs/latest")
 def latest_run() -> dict[str, Any]:
     """Return lightweight metadata for the newest run."""
@@ -75,6 +96,14 @@ def latest_run_summary() -> dict[str, Any]:
     run_id = _latest_run_id_or_404()
     run_path = _resolve_run_path(run_id)
     return _read_json(run_path / "regime_summary.json", run_id=run_id)
+
+
+@router.get("/runs/latest/evaluation")
+def latest_run_evaluation() -> dict[str, Any]:
+    """Return evaluation artifact for latest run."""
+    run_id = _latest_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return _read_json(run_path / "evaluation.json", run_id=run_id)
 
 
 @router.get("/runs/latest/plot")
@@ -93,6 +122,13 @@ def run_summary(run_id: str) -> dict[str, Any]:
     """Return regime summary for a specific run id."""
     run_path = _resolve_run_path(run_id)
     return _read_json(run_path / "regime_summary.json", run_id=run_id)
+
+
+@router.get("/runs/{run_id}/evaluation")
+def run_evaluation(run_id: str) -> dict[str, Any]:
+    """Return evaluation artifact for a specific run id."""
+    run_path = _resolve_run_path(run_id)
+    return _read_json(run_path / "evaluation.json", run_id=run_id)
 
 
 @router.get("/runs/{run_id}/plot")
@@ -162,11 +198,13 @@ def ui_page() -> HTMLResponse:
 </head>
 <body>
   <h1>{title}</h1>
+  <div id="pinnedInfo"><strong>Pinned run:</strong> none</div>
   <div id="status">Loading runs...</div>
   <div class="row">
     <label for="runSelect"><strong>Run:</strong></label>
     <select id="runSelect"></select>
     <button id="refreshBtn" type="button">Refresh</button>
+    <button id="pinBtn" type="button">Pin this run</button>
   </div>
   <div class="box">
     <div id="currentRegime">Current regime: N/A</div>
@@ -181,7 +219,9 @@ def ui_page() -> HTMLResponse:
   <script>
     const runSelect = document.getElementById("runSelect");
     const refreshBtn = document.getElementById("refreshBtn");
+    const pinBtn = document.getElementById("pinBtn");
     const statusEl = document.getElementById("status");
+    const pinnedInfoEl = document.getElementById("pinnedInfo");
     const currentRegimeEl = document.getElementById("currentRegime");
     const currentMetaEl = document.getElementById("currentMeta");
     const summaryPre = document.getElementById("summaryPre");
@@ -195,6 +235,15 @@ def ui_page() -> HTMLResponse:
         throw new Error(detail);
       }}
       return data;
+    }}
+
+    async function loadPinned() {{
+      try {{
+        const pinned = await fetchJson("/runs/pinned");
+        pinnedInfoEl.innerHTML = "<strong>Pinned run:</strong> " + pinned.run_id;
+      }} catch (err) {{
+        pinnedInfoEl.innerHTML = "<strong>Pinned run:</strong> none";
+      }}
     }}
 
     function formatSummary(summary) {{
@@ -241,6 +290,7 @@ def ui_page() -> HTMLResponse:
       try {{
         const payload = await fetchJson("/runs");
         const runs = Array.isArray(payload.runs) ? payload.runs : [];
+        await loadPinned();
         runSelect.innerHTML = "";
         if (runs.length === 0) {{
           statusEl.textContent = "No runs available. Train a model first.";
@@ -266,6 +316,21 @@ def ui_page() -> HTMLResponse:
     runSelect.addEventListener("change", () => {{
       if (runSelect.value) {{
         loadRun(runSelect.value);
+      }}
+    }});
+    pinBtn.addEventListener("click", async () => {{
+      if (!runSelect.value) {{
+        return;
+      }}
+      try {{
+        const runId = runSelect.value;
+        await fetchJson("/runs/" + encodeURIComponent(runId) + "/pin", {{
+          method: "POST"
+        }});
+        await loadPinned();
+        statusEl.textContent = "Pinned run " + runId;
+      }} catch (err) {{
+        statusEl.textContent = "Error pinning run: " + err.message;
       }}
     }});
     refreshBtn.addEventListener("click", refreshRuns);
@@ -447,6 +512,71 @@ def forecast(
     return payload
 
 
+@router.get("/forecast_v2")
+def forecast_v2(
+    run_id: Optional[str] = Query(default=None),
+    use_pinned: bool = Query(default=False),
+    horizon: int = Query(default=10, ge=1, le=365),
+) -> dict[str, Any]:
+    """Return structured forecast moments with semantic state probabilities."""
+    resolved_run_id = _resolve_effective_run_id(run_id=run_id, use_pinned=use_pinned)
+    run_path = _resolve_run_path(resolved_run_id)
+
+    model_params = _load_forecast_model_params(run_path=run_path)
+    probs_payload = _read_json(run_path / "predict_proba.json", run_id=run_path.name)
+    regime_probabilities = np.asarray(probs_payload.get("regime_probabilities", []), dtype=np.float64)
+    dates = probs_payload.get("dates", [])
+    if regime_probabilities.ndim != 2 or regime_probabilities.shape[0] == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_path.name} has malformed artifact: predict_proba.json",
+        )
+    if len(dates) != regime_probabilities.shape[0]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_path.name} has malformed artifact: predict_proba.json",
+        )
+
+    transition_matrix = np.asarray(model_params["transition_matrix"], dtype=np.float64)
+    mu = np.asarray(model_params["mu"], dtype=np.float64)
+    sigma = np.asarray(model_params["sigma"], dtype=np.float64)
+    current = np.asarray(regime_probabilities[-1], dtype=np.float64)
+
+    n_states = int(current.shape[0])
+    labels_map = _with_default_labels(_read_label_mapping(run_path), n_states)
+    expected_index = 1.0
+    rows: list[dict[str, Any]] = []
+
+    for step in range(1, horizon + 1):
+        current = current @ transition_matrix
+        exp_return, exp_vol = probability_weighted_moments(
+            state_probs=current,
+            mu=mu,
+            sigma=sigma,
+        )
+        expected_index *= float(np.exp(exp_return))
+
+        rows.append(
+            {
+                "horizon": int(step),
+                "state_probs": {
+                    labels_map.get(str(i), f"regime_{i}"): float(current[i])
+                    for i in range(n_states)
+                },
+                "expected_return": float(exp_return),
+                "expected_vol": float(exp_vol),
+                "expected_price_index": float(expected_index),
+            }
+        )
+
+    return {
+        "run_id": run_path.name,
+        "as_of_date": str(dates[-1]),
+        "horizon": int(horizon),
+        "forecast": rows,
+    }
+
+
 def _resolve_run_path(run_id: Optional[str]) -> Path:
     try:
         return resolve_run_dir(run_id=run_id, runs_root=RUNS_ROOT)
@@ -468,6 +598,51 @@ def _latest_run_id_or_404() -> str:
     if not run_ids:
         raise HTTPException(status_code=404, detail="No runs found under runs/")
     return run_ids[0]
+
+
+def _resolve_effective_run_id(run_id: str | None, use_pinned: bool) -> str:
+    if run_id is not None:
+        return run_id
+    if use_pinned:
+        return _read_pinned_run_id_or_404()
+    return _latest_run_id_or_404()
+
+
+def _pinned_run_file() -> Path:
+    return RUNS_ROOT / PINNED_RUN_FILENAME
+
+
+def _validate_run_id_for_pin(run_id: str) -> None:
+    if not run_id.startswith("run_"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Only run ids starting with 'run_' can be pinned: {run_id}",
+        )
+
+
+def _read_pinned_run_id_or_404() -> str:
+    pinned_path = _pinned_run_file()
+    if not pinned_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Pinned run file not found: {PINNED_RUN_FILENAME}",
+        )
+
+    pinned_run_id = pinned_path.read_text(encoding="utf-8").strip()
+    if not pinned_run_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Pinned run file is empty: {PINNED_RUN_FILENAME}",
+        )
+
+    _validate_run_id_for_pin(pinned_run_id)
+    run_path = RUNS_ROOT / pinned_run_id
+    if not run_path.exists() or not run_path.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Pinned run directory not found: {pinned_run_id}",
+        )
+    return pinned_run_id
 
 
 def _latest_run_payload(run_id: str, run_path: Path) -> dict[str, Any]:

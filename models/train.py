@@ -143,6 +143,38 @@ def _log_return_short_series_message(price_df: pd.DataFrame) -> str:
     )
 
 
+def _transition_entropy(transition_matrix: np.ndarray) -> float:
+    a_mat = np.asarray(transition_matrix, dtype=np.float64)
+    clipped = np.clip(a_mat, 1e-12, 1.0)
+    row_entropy = -np.sum(clipped * np.log(clipped), axis=1)
+    return float(np.mean(row_entropy))
+
+
+def _viterbi_segment_stats(states: np.ndarray) -> dict[str, float | int | None]:
+    seq = np.asarray(states, dtype=np.int64)
+    if seq.ndim != 1 or seq.size == 0:
+        return {"segment_count": 0, "mean_duration": None, "max_duration": None}
+
+    durations: list[int] = []
+    current = int(seq[0])
+    count = 1
+    for state in seq[1:]:
+        state_i = int(state)
+        if state_i == current:
+            count += 1
+        else:
+            durations.append(count)
+            current = state_i
+            count = 1
+    durations.append(count)
+
+    return {
+        "segment_count": int(len(durations)),
+        "mean_duration": float(np.mean(durations)),
+        "max_duration": int(np.max(durations)),
+    }
+
+
 def resolve_run_dir(run_id: Optional[str], runs_root: str | Path = "runs") -> Path:
     root = Path(runs_root)
     if run_id:
@@ -276,6 +308,25 @@ def train_model_run(
         "label_mapping": regime_labels,
     }
 
+    occupancy = np.asarray(regime_summary.get("state_occupancy", []), dtype=np.float64)
+    regime_diagnostics: list[dict[str, Any]] = []
+    for row in regime_summary.get("regimes", []):
+        regime_idx = int(row["regime"])
+        occ = (
+            float(occupancy[regime_idx])
+            if occupancy.ndim == 1 and regime_idx < occupancy.shape[0]
+            else float(row.get("avg_posterior_probability", 0.0))
+        )
+        regime_diagnostics.append(
+            {
+                "regime": regime_idx,
+                "label": row.get("label", f"regime_{regime_idx}"),
+                "occupancy": occ,
+                "avg_posterior_probability": float(row.get("avg_posterior_probability", occ)),
+                "implied_avg_duration_days": row.get("implied_avg_duration_days"),
+            }
+        )
+
     default_forecast = forecast_predictive_distribution(
         last_posterior=filter_probs[-1],
         transition_matrix=params["transition_matrix"],
@@ -310,6 +361,25 @@ def train_model_run(
         "created_at_utc": run_created_at,
     }
 
+    evaluation_payload = {
+        "run_id": run_id_final,
+        "created_at_utc": run_created_at,
+        "n_obs": int(returns.shape[0]),
+        "n_states": int(n_states),
+        "metrics": {
+            "best_val_log_likelihood": float(history.get("best_val_log_likelihood", val_ll)),
+            "test_avg_log_likelihood": float(test_ll / float(test_obs.size)),
+        },
+        "regime_diagnostics": {
+            "implied_avg_duration_days": [
+                row.get("implied_avg_duration_days") for row in regime_summary.get("regimes", [])
+            ],
+            "transition_entropy": _transition_entropy(params["transition_matrix"]),
+            "regimes": regime_diagnostics,
+            "viterbi_segment_stats": _viterbi_segment_stats(viterbi_states),
+        },
+    }
+
     config_payload = {
         "run_id": run_id_final,
         "config_path": str(config_path),
@@ -327,6 +397,7 @@ def train_model_run(
         "config.json",
         "model_params.npz",
         "model_params.json",
+        "evaluation.json",
         "metrics.json",
         "transition_matrix.json",
         "regime_labels.json",
@@ -353,6 +424,7 @@ def train_model_run(
     _write_json(run_path / "config.json", config_payload)
     model.save(run_path / "model_params.npz")
     _write_json(run_path / "model_params.json", model_params_payload)
+    _write_json(run_path / "evaluation.json", evaluation_payload)
     _write_json(run_path / "metrics.json", metrics_payload)
     _write_json(run_path / "transition_matrix.json", transition_payload)
     _write_json(run_path / "regime_labels.json", {"label_mapping": regime_labels})
