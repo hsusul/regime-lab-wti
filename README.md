@@ -4,6 +4,13 @@ Production-oriented probabilistic regime monitoring for **WTI Cushing daily spot
 
 This project trains a 3-state Gaussian Hidden Markov Model (HMM) on daily **log returns** of WTI spot prices and serves model outputs through a FastAPI service.
 
+## Why it matters
+
+- Reproducibility: each run stores model, metrics, and data metadata with stable run ids.
+- Artifact-backed inference: API endpoints read run artifacts first, so old runs remain queryable.
+- Integrity checks: manifest hashes and `data_hash` make tampering and drift visible.
+- Monitoring-ready: alerts, backtests, and forecast diagnostics expose practical model risk signals.
+
 ## What regimes mean
 
 Each hidden regime represents a distinct return/volatility profile:
@@ -92,6 +99,12 @@ Train one run locally:
 python scripts/train_local.py --config configs/default.yaml
 ```
 
+Run rolling retrain only when stale (default 3 days):
+
+```bash
+python -m scripts.runner --stale-days 3 --config configs/default.yaml
+```
+
 Start API:
 
 ```bash
@@ -131,8 +144,10 @@ By default, the HTML is saved to `runs/<run_id>/regimes.html`.
 - `GET /regime_summary` -> regime stats, durations, transition counts
 - `GET /forecast` -> multi-step predictive mean + uncertainty interval
 - `GET /forecast_v3` -> additive forecast schema (label probs, raw probs, intervals, optional stationary payload)
+- `GET /runs/{run_id}/backtest` -> simple regime-filtered backtest usefulness metrics
+- `GET /runs/{run_id}/report.html` -> lazy HTML report (occupancy, transition table, events, baselines, alert/drift examples)
 - `POST /predict_current` -> latest/current regime label and state
-- `POST /alerts/evaluate` -> artifact-first alert evaluation for selected run
+- `POST /alerts/evaluate` -> artifact-first alert evaluation (+ optional threshold calibration window)
 
 ## How to use the API
 
@@ -166,6 +181,7 @@ curl -X POST "http://127.0.0.1:8000/predict_current" -H 'Content-Type: applicati
 ```bash
 make test
 make train
+make runner
 make plot
 make ui
 ```
@@ -254,8 +270,8 @@ Small helper client:
 python -m scripts.client list_runs
 python -m scripts.client latest
 python -m scripts.client predict_current --include-probs
-python -m scripts.client forecast_v3 --run-id <RUN_ID> --include-stationary
-python -m scripts.client alerts_evaluate --run-id <RUN_ID> --shock-threshold 0.2
+python -m scripts.client forecast_v3 --run-id <RUN_ID> --include-stationary --include-quantiles
+python -m scripts.client alerts_evaluate --run-id <RUN_ID> --calibration-window-days 30 --shock-threshold 0.2
 python -m scripts.client bundle --run-id <RUN_ID> --extras report,openapi,run_info
 python -m scripts.client notes_put --run-id <RUN_ID> --content "release notes"
 ```
@@ -328,6 +344,11 @@ Each run is persisted under `runs/<run_id>/`:
 - `regime_summary.json`
 - `predict_proba.json`
 - `forecast_default.json`
+- `baselines.json`
+- `backtest.json`
+- `data_meta.json`
+- `forecast_eval.json` (includes quantile coverage when enabled)
+- `report.html` (lazy-generated on demand)
 
 `runs/latest_run.txt` tracks the most recent run.
 

@@ -7,10 +7,28 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
-import tensorflow as tf
-import tensorflow_probability as tfp
 
-tfd = tfp.distributions
+tf = None
+tfp = None
+tfd = None
+
+
+def _require_tensorflow() -> None:
+    """Import TensorFlow/TFP lazily so artifact-first paths do not require them."""
+    global tf, tfp, tfd
+    if tf is not None and tfp is not None and tfd is not None:
+        return
+    try:
+        import tensorflow as _tf
+        import tensorflow_probability as _tfp
+    except Exception as exc:
+        raise ImportError(
+            "TensorFlow + TensorFlow Probability are required for HMM training/inference."
+        ) from exc
+
+    tf = _tf
+    tfp = _tfp
+    tfd = _tfp.distributions
 
 
 @dataclass
@@ -28,6 +46,7 @@ class GaussianHMMTFP:
     """Trainable Gaussian Hidden Markov Model using TensorFlow Probability."""
 
     def __init__(self, n_states: int = 3, seed: int = 42) -> None:
+        _require_tensorflow()
         if n_states <= 0:
             raise ValueError("n_states must be > 0")
 

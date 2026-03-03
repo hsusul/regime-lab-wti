@@ -6,8 +6,9 @@ B ?= run_B
 TRASH ?= run_YYYYMMDDTHHMMSSZ_example_YYYYMMDDTHHMMSSZ
 NOTES ?= "run notes"
 EXTRAS ?=
+STALE_DAYS ?= 3
 
-.PHONY: install test train plot api ui integrity bundle version drift report delete restore trash_list trash_get trash_delete trash_purge notes_get notes_put alerts_evaluate compare_get forecast_v3
+.PHONY: install test train plot plots smoke runner api ui integrity bundle version drift report delete restore trash_list trash_get trash_delete trash_purge notes_get notes_put alerts_evaluate compare_get forecast_v3
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -22,6 +23,16 @@ train:
 
 plot:
 	$(PYTHON) -m scripts.make_plots
+
+plots:
+	$(PYTHON) -m scripts.make_plots --run-id $(RUN)
+
+smoke:
+	$(PYTHON) -m compileall app models scripts tests
+	pytest -q
+
+runner:
+	$(PYTHON) -m scripts.runner --stale-days $(STALE_DAYS) --config configs/default.yaml
 
 api:
 	uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
