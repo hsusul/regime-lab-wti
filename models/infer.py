@@ -139,6 +139,14 @@ def load_model_params_json(path: Path) -> dict[str, np.ndarray]:
     if transition_matrix.shape != (n_states, n_states):
         raise ValueError("transition_matrix shape mismatch with mu/sigma")
 
+    robust_sigma_raw = payload.get("robust_sigma")
+    robust_sigma = None
+    if robust_sigma_raw is not None:
+        robust_sigma_arr = np.asarray(robust_sigma_raw, dtype=np.float64)
+        if robust_sigma_arr.shape != sigma.shape:
+            raise ValueError("robust_sigma shape mismatch with sigma")
+        robust_sigma = np.maximum(robust_sigma_arr, 1e-8)
+
     initial_probs_raw = payload.get("initial_probs")
     initial_logits_raw = payload.get("initial_logits")
     if initial_probs_raw is not None:
@@ -159,13 +167,16 @@ def load_model_params_json(path: Path) -> dict[str, np.ndarray]:
     else:
         initial_probs = stationary_distribution(transition_matrix)
 
-    return {
+    out = {
         "n_states": np.asarray([n_states], dtype=np.int64),
         "transition_matrix": transition_matrix,
         "mu": mu,
         "sigma": sigma,
         "initial_probs": initial_probs,
     }
+    if robust_sigma is not None:
+        out["robust_sigma"] = robust_sigma
+    return out
 
 
 def _normal_pdf(x: float, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:

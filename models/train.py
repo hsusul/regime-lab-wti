@@ -15,12 +15,11 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 import yaml
 
 from energy_data.eia_client import EIAClientConfig, EIAWTIClient
 from energy_data.features import compute_log_returns, time_based_split
-from models.hmm_tfp import GaussianHMMTFP, HMMTrainingConfig
+from models.baselines import evaluate_baselines
 from models.infer import (
     assign_regime_labels,
     build_regime_summary,
@@ -66,6 +65,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "forecast": {
         "default_horizon": 10,
         "interval": 0.95,
+        "include_quantiles": False,
     },
 }
 
@@ -101,7 +101,13 @@ def load_config(config_path: str | Path) -> PipelineConfig:
 def set_global_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    tf.keras.utils.set_random_seed(seed)
+    try:
+        import tensorflow as tf
+
+        tf.keras.utils.set_random_seed(seed)
+    except Exception:
+        # Keep non-TF paths (tests, artifact-only workflows) importable.
+        pass
 
 
 def _make_run_id() -> str:
@@ -129,6 +135,10 @@ def _safe_git_commit_hash(repo_root: Path) -> str | None:
 def _config_hash(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _log_return_short_series_message(price_df: pd.DataFrame) -> str:
@@ -175,6 +185,206 @@ def _viterbi_segment_stats(states: np.ndarray) -> dict[str, float | int | None]:
         "segment_count": int(len(durations)),
         "mean_duration": float(np.mean(durations)),
         "max_duration": int(np.max(durations)),
+    }
+
+
+def _build_data_meta_payload(price_df: pd.DataFrame, features_df: pd.DataFrame) -> dict[str, Any]:
+    prices = price_df.copy()
+    prices["date"] = pd.to_datetime(prices.get("date"), errors="coerce")
+    prices["price"] = pd.to_numeric(prices.get("price"), errors="coerce")
+
+    features = features_df.copy()
+    features["date"] = pd.to_datetime(features.get("date"), errors="coerce")
+    features["log_return"] = pd.to_numeric(features.get("log_return"), errors="coerce")
+
+    canonical = features[["date", "log_return"]].dropna().copy()
+    canonical["date"] = canonical["date"].dt.strftime("%Y-%m-%d")
+    canonical = canonical.sort_values("date").reset_index(drop=True)
+    dataset_bytes = canonical.to_csv(index=False, float_format="%.12g").encode("utf-8")
+
+    return {
+        "dataset_hash": _sha256_bytes(dataset_bytes),
+        "start_date": (
+            str(canonical["date"].iloc[0]) if not canonical.empty else None
+        ),
+        "end_date": (
+            str(canonical["date"].iloc[-1]) if not canonical.empty else None
+        ),
+        "row_counts": {
+            "raw_rows": int(prices.shape[0]),
+            "feature_rows": int(features.shape[0]),
+            "hash_rows": int(canonical.shape[0]),
+        },
+        "missingness": {
+            "raw_missing_price_rows": int(prices["price"].isna().sum()),
+            "raw_non_positive_price_rows": int((prices["price"] <= 0).fillna(False).sum()),
+            "feature_missing_return_rows": int(features["log_return"].isna().sum()),
+        },
+    }
+
+
+def _robust_sigma_by_regime(
+    returns: np.ndarray,
+    states: np.ndarray,
+    fallback_sigma: np.ndarray,
+) -> list[float]:
+    obs = np.asarray(returns, dtype=np.float64)
+    seq = np.asarray(states, dtype=np.int64)
+    sigma = np.asarray(fallback_sigma, dtype=np.float64)
+    if obs.shape[0] != seq.shape[0]:
+        raise ValueError("returns and states must align for robust sigma computation")
+
+    robust_sigma: list[float] = []
+    for state in range(sigma.shape[0]):
+        state_obs = obs[seq == state]
+        if state_obs.size < 2:
+            robust_sigma.append(float(max(sigma[state], 1e-6)))
+            continue
+        median = float(np.median(state_obs))
+        mad = float(np.median(np.abs(state_obs - median)))
+        robust = max(1.4826 * mad, 1e-6)
+        if not np.isfinite(robust):
+            robust = float(max(sigma[state], 1e-6))
+        robust_sigma.append(float(robust))
+    return robust_sigma
+
+
+def _regime_stability_metrics(
+    states: np.ndarray,
+    labels_map: dict[str, str],
+    *,
+    window_days: int = 60,
+) -> dict[str, Any]:
+    seq = np.asarray(states, dtype=np.int64)
+    if seq.ndim != 1 or seq.size == 0:
+        return {
+            "window_days": int(window_days),
+            "label_flip_rate": None,
+            "label_flip_rate_last_n_days": None,
+            "avg_segment_length_by_label": {},
+        }
+
+    n_window = min(max(int(window_days), 2), int(seq.size))
+    tail = seq[-n_window:]
+    flips = int(np.sum(tail[1:] != tail[:-1])) if tail.size > 1 else 0
+    flip_rate = float(flips / max(int(tail.size) - 1, 1))
+
+    durations_by_label: dict[str, list[int]] = {}
+    current = int(seq[0])
+    count = 1
+    for state in seq[1:]:
+        state_i = int(state)
+        if state_i == current:
+            count += 1
+            continue
+        label = labels_map.get(str(current), f"regime_{current}")
+        durations_by_label.setdefault(label, []).append(int(count))
+        current = state_i
+        count = 1
+    label = labels_map.get(str(current), f"regime_{current}")
+    durations_by_label.setdefault(label, []).append(int(count))
+
+    avg_segment_length_by_label = {
+        regime_label: float(np.mean(np.asarray(durations, dtype=np.float64)))
+        for regime_label, durations in durations_by_label.items()
+        if durations
+    }
+
+    return {
+        "window_days": int(n_window),
+        "label_flip_rate": flip_rate,
+        "label_flip_rate_last_n_days": flip_rate,
+        "avg_segment_length_by_label": avg_segment_length_by_label,
+    }
+
+
+def _infer_shock_state(regime_labels: dict[str, str], sigma: np.ndarray) -> int:
+    for key, value in regime_labels.items():
+        if str(value) == "shock":
+            return int(key)
+    sigma_arr = np.asarray(sigma, dtype=np.float64)
+    return int(np.argmax(sigma_arr))
+
+
+def _max_drawdown_proxy(log_returns: np.ndarray) -> float | None:
+    obs = np.asarray(log_returns, dtype=np.float64)
+    if obs.size == 0:
+        return None
+    cumulative = np.exp(np.cumsum(obs))
+    peak = np.maximum.accumulate(cumulative)
+    drawdown = cumulative / np.maximum(peak, 1e-12) - 1.0
+    return float(np.min(drawdown))
+
+
+def _annualized_vol_proxy(log_returns: np.ndarray) -> float | None:
+    obs = np.asarray(log_returns, dtype=np.float64)
+    if obs.size < 2:
+        return None
+    return float(np.std(obs, ddof=1) * np.sqrt(252.0))
+
+
+def _build_backtest_payload(
+    run_id: str,
+    created_at_utc: str,
+    returns: np.ndarray,
+    states: np.ndarray,
+    labels_map: dict[str, str],
+    sigma: np.ndarray,
+) -> dict[str, Any]:
+    obs = np.asarray(returns, dtype=np.float64)
+    seq = np.asarray(states, dtype=np.int64)
+    shock_state = _infer_shock_state(labels_map, sigma=sigma)
+    active = (seq != shock_state).astype(np.float64)
+    strategy_returns = obs * active
+
+    return {
+        "run_id": run_id,
+        "created_at_utc": created_at_utc,
+        "strategy_name": "avoid_shock_regime",
+        "shock_state": int(shock_state),
+        "shock_label": labels_map.get(str(shock_state), f"regime_{shock_state}"),
+        "n_days": int(obs.size),
+        "days_avoided": int(np.sum(seq == shock_state)),
+        "participation_rate": float(np.mean(active)),
+        "annualized_vol_proxy": _annualized_vol_proxy(strategy_returns),
+        "max_drawdown_proxy": _max_drawdown_proxy(strategy_returns),
+        "buy_hold_annualized_vol_proxy": _annualized_vol_proxy(obs),
+        "buy_hold_max_drawdown_proxy": _max_drawdown_proxy(obs),
+        "avg_daily_return_proxy": float(np.mean(strategy_returns)),
+    }
+
+
+def _baseline_comparison_summary(
+    baseline_metrics: dict[str, Any],
+    *,
+    hmm_val_avg_ll: float,
+    hmm_test_avg_ll: float,
+) -> dict[str, Any]:
+    baselines = baseline_metrics.get("baselines", {})
+    best_name = baseline_metrics.get("summary", {}).get("best_baseline_name")
+    best_payload = baselines.get(best_name, {}) if isinstance(baselines, dict) and best_name else {}
+    best_val = (
+        float(best_payload.get("val", {}).get("avg_log_likelihood"))
+        if isinstance(best_payload, dict) and best_payload.get("val", {}).get("avg_log_likelihood") is not None
+        else None
+    )
+    best_test = (
+        float(best_payload.get("test", {}).get("avg_log_likelihood"))
+        if isinstance(best_payload, dict) and best_payload.get("test", {}).get("avg_log_likelihood") is not None
+        else None
+    )
+    return {
+        "best_baseline_name": best_name,
+        "best_baseline_val_avg_log_likelihood": best_val,
+        "best_baseline_test_avg_log_likelihood": best_test,
+        "hmm_val_avg_log_likelihood": float(hmm_val_avg_ll),
+        "hmm_test_avg_log_likelihood": float(hmm_test_avg_ll),
+        "delta_vs_hmm_val_avg_log_likelihood": (
+            None if best_val is None else float(best_val - float(hmm_val_avg_ll))
+        ),
+        "delta_vs_hmm_test_avg_log_likelihood": (
+            None if best_test is None else float(best_test - float(hmm_test_avg_ll))
+        ),
     }
 
 
@@ -300,6 +510,7 @@ def _build_forecast_eval_payload(
     mu: np.ndarray,
     sigma: np.ndarray,
     interval: float,
+    include_quantiles: bool = False,
     window: int = 120,
     max_horizon: int = 5,
 ) -> dict[str, Any]:
@@ -311,6 +522,8 @@ def _build_forecast_eval_payload(
     sigma_arr = np.asarray(sigma, dtype=np.float64)
 
     z = NormalDist().inv_cdf(0.5 + 0.5 * float(interval))
+    z05 = NormalDist().inv_cdf(0.05)
+    z95 = NormalDist().inv_cdf(0.95)
     horizon_rows: list[dict[str, Any]] = []
 
     n_obs = int(obs.shape[0])
@@ -330,6 +543,7 @@ def _build_forecast_eval_payload(
         origin_start = max(0, origin_end - int(window))
         abs_errors: list[float] = []
         coverages: list[float] = []
+        quantile_coverages: list[float] = []
 
         for t in range(origin_start, origin_end):
             state_probs = np.asarray(probs[t], dtype=np.float64)
@@ -346,21 +560,29 @@ def _build_forecast_eval_payload(
             lower = exp_return - z * exp_vol
             upper = exp_return + z * exp_vol
             coverages.append(1.0 if lower <= realized <= upper else 0.0)
+            if include_quantiles:
+                p05 = exp_return + z05 * exp_vol
+                p95 = exp_return + z95 * exp_vol
+                quantile_coverages.append(1.0 if p05 <= realized <= p95 else 0.0)
 
-        horizon_rows.append(
-            {
-                "horizon": int(horizon),
-                "n_samples": int(len(abs_errors)),
-                "mae": (float(np.mean(abs_errors)) if abs_errors else None),
-                "coverage": (float(np.mean(coverages)) if coverages else None),
-            }
-        )
+        row = {
+            "horizon": int(horizon),
+            "n_samples": int(len(abs_errors)),
+            "mae": (float(np.mean(abs_errors)) if abs_errors else None),
+            "coverage": (float(np.mean(coverages)) if coverages else None),
+        }
+        if include_quantiles:
+            row["quantile_coverage_p05_p95"] = (
+                float(np.mean(quantile_coverages)) if quantile_coverages else None
+            )
+        horizon_rows.append(row)
 
     return {
         "run_id": run_id,
         "created_at_utc": created_at_utc,
         "window": int(window),
         "interval": float(interval),
+        "include_quantiles": bool(include_quantiles),
         "horizons": horizon_rows,
     }
 
@@ -420,6 +642,8 @@ def train_model_run(
             raise ValueError(_log_return_short_series_message(prices)) from exc
         raise
 
+    data_meta_payload = _build_data_meta_payload(prices, features)
+
     dates = [d.strftime("%Y-%m-%d") for d in features["date"]]
     returns = features["log_return"].to_numpy(dtype=np.float64)
 
@@ -428,6 +652,8 @@ def train_model_run(
         train_frac=float(cfg.split["train_frac"]),
         val_frac=float(cfg.split["val_frac"]),
     )
+
+    from models.hmm_tfp import GaussianHMMTFP, HMMTrainingConfig
 
     model = GaussianHMMTFP(n_states=n_states, seed=seed)
     history = model.fit(
@@ -474,6 +700,12 @@ def train_model_run(
     viterbi_states = model.viterbi(returns)
     if viterbi_states.shape[0] != returns.shape[0]:
         raise ValueError("Viterbi decode output length does not match returns length.")
+    robust_sigma = _robust_sigma_by_regime(
+        returns=returns,
+        states=viterbi_states,
+        fallback_sigma=params["sigma"],
+    )
+    model_params_payload["robust_sigma"] = [float(x) for x in robust_sigma]
 
     predict_payload = predict_proba_payload(dates=dates, returns=returns, filter_probs=filter_probs)
     viterbi_payload = {
@@ -534,6 +766,32 @@ def train_model_run(
     run_path.mkdir(parents=True, exist_ok=True)
 
     run_created_at = datetime.now(timezone.utc).isoformat()
+    baseline_metrics = evaluate_baselines(
+        train_obs=train_obs,
+        val_obs=val_obs,
+        test_obs=test_obs,
+        seed=seed,
+    )
+    baseline_comparison = _baseline_comparison_summary(
+        baseline_metrics,
+        hmm_val_avg_ll=float(val_ll / float(val_obs.size)),
+        hmm_test_avg_ll=float(test_ll / float(test_obs.size)),
+    )
+    baselines_payload = {
+        "run_id": run_id_final,
+        "created_at_utc": run_created_at,
+        "split_sizes": {
+            "train": int(train_obs.size),
+            "val": int(val_obs.size),
+            "test": int(test_obs.size),
+        },
+        "baselines": baseline_metrics.get("baselines", {}),
+        "summary": {
+            **baseline_metrics.get("summary", {}),
+            **baseline_comparison,
+        },
+    }
+
     events_payload = _build_events_payload(
         run_id=run_id_final,
         dates=dates,
@@ -550,8 +808,17 @@ def train_model_run(
         mu=params["mu"],
         sigma=params["sigma"],
         interval=float(cfg.forecast.get("interval", 0.95)),
+        include_quantiles=bool(cfg.forecast.get("include_quantiles", False)),
         window=120,
         max_horizon=5,
+    )
+    backtest_payload = _build_backtest_payload(
+        run_id=run_id_final,
+        created_at_utc=run_created_at,
+        returns=returns,
+        states=viterbi_states,
+        labels_map=regime_labels,
+        sigma=params["sigma"],
     )
 
     metrics_payload = {
@@ -590,6 +857,12 @@ def train_model_run(
             "viterbi_segment_stats": _viterbi_segment_stats(viterbi_states),
         },
         "event_classifier_summary": _event_classifier_summary(events_payload),
+        "regime_stability": _regime_stability_metrics(
+            states=viterbi_states,
+            labels_map=regime_labels,
+            window_days=60,
+        ),
+        "baseline_comparison": baseline_comparison,
     }
 
     config_payload = {
@@ -619,6 +892,9 @@ def train_model_run(
         "events.json",
         "forecast_default.json",
         "forecast_eval.json",
+        "baselines.json",
+        "backtest.json",
+        "data_meta.json",
         "manifest.json",
     ]
 
@@ -631,6 +907,7 @@ def train_model_run(
         "seed": int(seed),
         "start_date": dates[0] if dates else None,
         "end_date": dates[-1] if dates else None,
+        "data_hash": data_meta_payload.get("dataset_hash"),
         "n_observations": int(returns.shape[0]),
         "artifacts": artifact_filenames,
     }
@@ -648,6 +925,9 @@ def train_model_run(
     _write_json(run_path / "events.json", events_payload)
     _write_json(run_path / "forecast_default.json", default_forecast)
     _write_json(run_path / "forecast_eval.json", forecast_eval_payload)
+    _write_json(run_path / "baselines.json", baselines_payload)
+    _write_json(run_path / "backtest.json", backtest_payload)
+    _write_json(run_path / "data_meta.json", data_meta_payload)
     write_manifest_with_provenance(run_dir=run_path, manifest_payload=manifest_payload)
 
     (run_root / "latest_run.txt").write_text(run_id_final, encoding="utf-8")

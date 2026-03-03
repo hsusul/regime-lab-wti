@@ -7,8 +7,10 @@ import os
 import time
 import zipfile
 from pathlib import Path
+from statistics import NormalDist
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
 import app.routes as routes
@@ -231,6 +233,15 @@ def test_evaluation_endpoints(monkeypatch, tmp_path: Path) -> None:
             "avg_event_duration_days_by_label": {"low_vol": 5.0, "mid_vol": 2.0, "shock": 1.0},
             "top_5_longest_events": [],
         },
+        "regime_stability": {
+            "window_days": 60,
+            "label_flip_rate_last_n_days": 0.15,
+            "avg_segment_length_by_label": {"low_vol": 5.0, "mid_vol": 3.0, "shock": 2.0},
+        },
+        "baseline_comparison": {
+            "best_baseline_name": "single_regime_gaussian",
+            "delta_vs_hmm_test_avg_log_likelihood": -0.02,
+        },
     }
     (run_dir / "evaluation.json").write_text(json.dumps(payload), encoding="utf-8")
 
@@ -243,6 +254,8 @@ def test_evaluation_endpoints(monkeypatch, tmp_path: Path) -> None:
     assert "regime_diagnostics" in by_id.json()
     assert "event_classifier_summary" in by_id.json()
     assert "event_counts_by_label" in by_id.json()["event_classifier_summary"]
+    assert "regime_stability" in by_id.json()
+    assert "baseline_comparison" in by_id.json()
 
     latest = client.get("/runs/latest/evaluation")
     assert latest.status_code == 200
@@ -527,6 +540,7 @@ def test_forecast_v2_endpoint(monkeypatch, tmp_path: Path) -> None:
                 ],
                 "mu": [0.001, 0.0, -0.01],
                 "sigma": [0.01, 0.015, 0.04],
+                "robust_sigma": [0.012, 0.017, 0.05],
             }
         ),
         encoding="utf-8",
@@ -968,6 +982,83 @@ def test_integrity_endpoint_detects_mismatch(monkeypatch, tmp_path: Path) -> Non
     assert body["mismatched"][0]["name"] == "a.json"
 
 
+def test_integrity_endpoint_warns_when_data_meta_missing(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260201T000000Z_integrity_missing_data_meta"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    payload_path = run_dir / "a.json"
+    payload_path.write_text('{"ok":1}', encoding="utf-8")
+    expected_hash = hashlib.sha256(payload_path.read_bytes()).hexdigest()
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "schema_version": 1,
+                "data_hash": "abc123",
+                "artifacts": ["manifest.json", "a.json", "data_meta.json"],
+                "artifacts_sha256": {"a.json": expected_hash},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    resp = client.get(f"/runs/{run_id}/integrity")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["ok"] is True
+    assert payload["mismatched"] == []
+    assert payload["missing"] == []
+    assert payload["warnings"]
+    assert "data_meta.json" in payload["warnings"][0]
+
+
+def test_integrity_endpoint_detects_tampered_data_meta(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260201T000000Z_integrity_data_meta"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    data_meta_path = run_dir / "data_meta.json"
+    data_meta_path.write_text(
+        json.dumps({"dataset_hash": "abc123", "row_counts": {"feature_rows": 100}}),
+        encoding="utf-8",
+    )
+    hash_initial = hashlib.sha256(data_meta_path.read_bytes()).hexdigest()
+    manifest = {
+        "run_id": run_id,
+        "schema_version": 1,
+        "data_hash": "abc123",
+        "artifacts": ["manifest.json", "data_meta.json"],
+        "artifacts_sha256": {"data_meta.json": hash_initial},
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    ok_resp = client.get(f"/runs/{run_id}/integrity")
+    assert ok_resp.status_code == 200
+    assert ok_resp.json()["ok"] is True
+
+    data_meta_path.write_text(
+        json.dumps({"dataset_hash": "tampered999", "row_counts": {"feature_rows": 100}}),
+        encoding="utf-8",
+    )
+    manifest["artifacts_sha256"]["data_meta.json"] = hashlib.sha256(data_meta_path.read_bytes()).hexdigest()
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    bad_resp = client.get(f"/runs/{run_id}/integrity")
+    assert bad_resp.status_code == 200
+    payload = bad_resp.json()
+    assert payload["ok"] is False
+    assert any(row["name"] == "data_hash" for row in payload["mismatched"])
+
+
 def test_bundle_zip_endpoint(monkeypatch, tmp_path: Path) -> None:
     runs_root = tmp_path / "runs"
     run_id = "run_20260201T000000Z_bundle"
@@ -1340,9 +1431,22 @@ def test_forecast_eval_endpoints(monkeypatch, tmp_path: Path) -> None:
         "run_id": run_id,
         "interval": 0.95,
         "window": 120,
+        "include_quantiles": True,
         "horizons": [
-            {"horizon": 1, "n_samples": 100, "mae": 0.01, "coverage": 0.93},
-            {"horizon": 2, "n_samples": 99, "mae": 0.012, "coverage": 0.92},
+            {
+                "horizon": 1,
+                "n_samples": 100,
+                "mae": 0.01,
+                "coverage": 0.93,
+                "quantile_coverage_p05_p95": 0.92,
+            },
+            {
+                "horizon": 2,
+                "n_samples": 99,
+                "mae": 0.012,
+                "coverage": 0.92,
+                "quantile_coverage_p05_p95": 0.9,
+            },
         ],
     }
     (run_dir / "forecast_eval.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -1353,8 +1457,36 @@ def test_forecast_eval_endpoints(monkeypatch, tmp_path: Path) -> None:
     by_id = client.get(f"/runs/{run_id}/forecast_eval")
     assert by_id.status_code == 200
     assert by_id.json()["run_id"] == run_id
+    assert by_id.json()["include_quantiles"] is True
+    assert "quantile_coverage_p05_p95" in by_id.json()["horizons"][0]
 
     latest = client.get("/runs/latest/forecast_eval")
+    assert latest.status_code == 200
+    assert latest.json()["run_id"] == run_id
+
+
+def test_backtest_endpoints(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260303T000000Z_backtest"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "strategy_name": "avoid_shock_regime",
+        "annualized_vol_proxy": 0.12,
+        "max_drawdown_proxy": -0.08,
+    }
+    (run_dir / "backtest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+
+    by_id = client.get(f"/runs/{run_id}/backtest")
+    assert by_id.status_code == 200
+    assert by_id.json()["run_id"] == run_id
+    assert by_id.json()["strategy_name"] == "avoid_shock_regime"
+
+    latest = client.get("/runs/latest/backtest")
     assert latest.status_code == 200
     assert latest.json()["run_id"] == run_id
 
@@ -1489,6 +1621,17 @@ def test_report_markdown_generation_and_alias(monkeypatch, tmp_path: Path) -> No
     assert latest.status_code == 200
     assert "# Run Report:" in latest.text
 
+    html_resp = client.get(f"/runs/{run_id}/report.html")
+    assert html_resp.status_code == 200
+    assert "<!doctype html>" in html_resp.text.lower()
+    assert "Occupancy Chart" in html_resp.text
+    assert "Transition Matrix" in html_resp.text
+    assert (run_dir / "report.html").exists()
+
+    latest_html = client.get("/runs/latest/report.html")
+    assert latest_html.status_code == 200
+    assert "<html" in latest_html.text.lower()
+
 
 def test_report_generation_for_frozen_run_does_not_write(monkeypatch, tmp_path: Path) -> None:
     runs_root = tmp_path / "runs"
@@ -1521,6 +1664,11 @@ def test_report_generation_for_frozen_run_does_not_write(monkeypatch, tmp_path: 
     assert response.status_code == 200
     assert "# Run Report:" in response.text
     assert not (run_dir / "report.md").exists()
+
+    html_response = client.get(f"/runs/{run_id}/report.html")
+    assert html_response.status_code == 200
+    assert "<html" in html_response.text.lower()
+    assert not (run_dir / "report.html").exists()
 
 
 def test_trash_management_endpoints(monkeypatch, tmp_path: Path) -> None:
@@ -1733,7 +1881,9 @@ def test_forecast_v3_endpoint(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
     client = TestClient(app)
 
-    resp = client.get(f"/forecast_v3?run_id={run_id}&horizon=3&include_stationary=true")
+    resp = client.get(
+        f"/forecast_v3?run_id={run_id}&horizon=3&include_stationary=true&include_quantiles=true"
+    )
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["run_id"] == run_id
@@ -1749,6 +1899,10 @@ def test_forecast_v3_endpoint(monkeypatch, tmp_path: Path) -> None:
     assert "expected_vol" in first
     assert "interval_low" in first
     assert "interval_high" in first
+    assert "p05" in first
+    assert "p50" in first
+    assert "p95" in first
+    assert payload["quantiles_enabled"] is True
     assert payload["stationary"] is not None
     assert len(payload["stationary"]["state_probs"]) == 3
     assert set(payload["stationary"]["implied_durations_days"].keys()) == {"low_vol", "mid_vol", "shock"}
@@ -1789,7 +1943,55 @@ def test_forecast_v3_npz_fallback(monkeypatch, tmp_path: Path) -> None:
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["params_source"] == "model_params.npz"
+    assert payload["quantiles_enabled"] is False
     assert len(payload["forecast"]) == 2
+
+
+def test_forecast_v3_quantiles_prefer_robust_sigma(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_id = "run_20260304T000000Z_fcastv3_robust_sigma"
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "model_params.json").write_text(
+        json.dumps(
+            {
+                "n_states": 2,
+                "initial_probs": [0.5, 0.5],
+                "transition_matrix": [[1.0, 0.0], [0.0, 1.0]],
+                "mu": [0.0, 0.0],
+                "sigma": [0.01, 0.01],
+                "robust_sigma": [0.10, 0.10],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "regime_labels.json").write_text(
+        json.dumps({"label_mapping": {"0": "low_vol", "1": "shock"}}),
+        encoding="utf-8",
+    )
+    (run_dir / "predict_proba.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-03-03", "2026-03-04"],
+                "returns": [0.0, 0.0],
+                "regime_probabilities": [[0.2, 0.8], [0.25, 0.75]],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+    resp = client.get(
+        f"/forecast_v3?run_id={run_id}&horizon=1&include_quantiles=true"
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    row = payload["forecast"][0]
+    z95 = NormalDist().inv_cdf(0.95)
+    assert row["p50"] == pytest.approx(row["expected_return"], rel=0, abs=1e-12)
+    assert row["p95"] == pytest.approx(row["expected_return"] + z95 * 0.10, rel=0, abs=1e-9)
+    assert row["p95"] > row["expected_return"] + z95 * 0.01
 
 
 def test_alerts_evaluate_endpoint(monkeypatch, tmp_path: Path) -> None:
@@ -1861,6 +2063,7 @@ def test_alerts_evaluate_endpoint(monkeypatch, tmp_path: Path) -> None:
     payload = resp.json()
     assert payload["run_id"] == run_target.name
     assert payload["triggered"] is True
+    assert payload["severity"] == "high"
     assert payload["selection"] == "run_id"
     assert payload["current_regime_label"] == "low_vol"
     assert payload["shock_prob"] == 0.7
@@ -1871,6 +2074,111 @@ def test_alerts_evaluate_endpoint(monkeypatch, tmp_path: Path) -> None:
     assert "forecast_coverage_low" in ids
     assert "transition_entropy_jump" in ids
     assert "transition_probability_high" in ids
+    for row in payload["alerts"]:
+        assert row["severity"] in {"low", "medium", "high"}
+        assert "recommended_action" in row
+
+
+def test_alerts_evaluate_calibration_window(monkeypatch, tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_ids = [
+        "run_20260301T000000Z_cal_a",
+        "run_20260302T000000Z_cal_b",
+        "run_20260303T000000Z_cal_target",
+    ]
+    for run_id in run_ids:
+        (runs_root / run_id).mkdir(parents=True, exist_ok=True)
+
+    fixtures = {
+        run_ids[0]: {
+            "end_date": "2026-03-01",
+            "shock_occ": 0.1,
+            "entropy": 0.2,
+            "coverage": 0.95,
+            "transition_matrix": [[0.7, 0.3], [0.1, 0.9]],
+        },
+        run_ids[1]: {
+            "end_date": "2026-03-02",
+            "shock_occ": 0.2,
+            "entropy": 0.4,
+            "coverage": 0.9,
+            "transition_matrix": [[0.65, 0.35], [0.2, 0.8]],
+        },
+        run_ids[2]: {
+            "end_date": "2026-03-03",
+            "shock_occ": 0.3,
+            "entropy": 0.8,
+            "coverage": 0.85,
+            "transition_matrix": [[0.55, 0.45], [0.25, 0.75]],
+        },
+    }
+
+    for run_id, row in fixtures.items():
+        run_dir = runs_root / run_id
+        (run_dir / "manifest.json").write_text(
+            json.dumps({"run_id": run_id, "end_date": row["end_date"]}),
+            encoding="utf-8",
+        )
+        (run_dir / "regime_summary.json").write_text(
+            json.dumps(
+                {
+                    "regimes": [
+                        {"label": "low_vol", "avg_posterior_probability": 1.0 - row["shock_occ"]},
+                        {"label": "shock", "avg_posterior_probability": row["shock_occ"]},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "evaluation.json").write_text(
+            json.dumps({"regime_diagnostics": {"transition_entropy": row["entropy"]}}),
+            encoding="utf-8",
+        )
+        (run_dir / "forecast_eval.json").write_text(
+            json.dumps({"horizons": [{"horizon": 1, "coverage": row["coverage"]}]}),
+            encoding="utf-8",
+        )
+        (run_dir / "transition_matrix.json").write_text(
+            json.dumps({"transition_matrix": row["transition_matrix"]}),
+            encoding="utf-8",
+        )
+
+    run_target = runs_root / run_ids[2]
+    (run_target / "regime_labels.json").write_text(
+        json.dumps({"label_mapping": {"0": "low_vol", "1": "shock"}}),
+        encoding="utf-8",
+    )
+    (run_target / "viterbi_states.json").write_text(
+        json.dumps({"dates": ["2026-03-03"], "states": [0], "labels": ["low_vol"]}),
+        encoding="utf-8",
+    )
+    (run_target / "predict_proba.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-03-03"],
+                "returns": [0.01],
+                "regime_probabilities": [[0.7, 0.3]],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(routes, "RUNS_ROOT", runs_root)
+    client = TestClient(app)
+    resp = client.post(
+        "/alerts/evaluate",
+        json={"run_id": run_ids[2], "calibration_window_days": 5},
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    rec = payload["threshold_recommendations"]
+    assert rec["n_runs"] == 3
+    assert rec["calibration_window_days"] == 5
+    thresholds = rec["recommended_thresholds"]
+    assert thresholds["shock_occupancy_threshold"] == pytest.approx(0.28, rel=0, abs=1e-9)
+    assert thresholds["coverage_threshold"] == pytest.approx(0.86, rel=0, abs=1e-9)
+    assert thresholds["transition_prob_threshold"] == pytest.approx(0.43, rel=0, abs=1e-9)
+    assert thresholds["transition_entropy_jump_threshold"] == pytest.approx(0.38, rel=0, abs=1e-9)
 
 
 def test_alerts_evaluate_missing_proba(monkeypatch, tmp_path: Path) -> None:
@@ -1902,6 +2210,7 @@ def test_alerts_evaluate_missing_proba(monkeypatch, tmp_path: Path) -> None:
     assert payload["run_id"] == run_id
     assert payload["shock_prob"] is None
     assert payload["selection"] == "latest"
+    assert payload["severity"] == "low"
 
 
 def test_compare_view_endpoint(monkeypatch, tmp_path: Path) -> None:

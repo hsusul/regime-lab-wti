@@ -117,6 +117,7 @@ def evaluate_alerts(
     use_pinned: bool = False,
     use_active: bool = False,
     use_latest: bool = False,
+    calibration_window_days: int | None = None,
     rules: dict[str, Any] | None = None,
     base_url: str = DEFAULT_BASE_URL,
 ) -> dict[str, Any]:
@@ -127,6 +128,8 @@ def evaluate_alerts(
     }
     if run_id is not None:
         payload["run_id"] = run_id
+    if calibration_window_days is not None:
+        payload["calibration_window_days"] = int(calibration_window_days)
     if rules is not None:
         payload["rules"] = rules
     return _request_json("POST", "/alerts/evaluate", base_url=base_url, payload=payload)
@@ -139,6 +142,7 @@ def forecast_v3(
     horizon: int = 10,
     interval: float = 0.95,
     include_stationary: bool = False,
+    include_quantiles: bool = False,
     base_url: str = DEFAULT_BASE_URL,
 ) -> dict[str, Any]:
     query = [f"horizon={int(horizon)}", f"interval={float(interval)}"]
@@ -148,6 +152,8 @@ def forecast_v3(
         query.append("use_pinned=true")
     if include_stationary:
         query.append("include_stationary=true")
+    if include_quantiles:
+        query.append("include_quantiles=true")
     return _request_json("GET", f"/forecast_v3?{'&'.join(query)}", base_url=base_url)
 
 
@@ -210,6 +216,7 @@ def _build_parser() -> argparse.ArgumentParser:
     alerts.add_argument("--use-pinned", action="store_true")
     alerts.add_argument("--use-active", action="store_true")
     alerts.add_argument("--use-latest", action="store_true")
+    alerts.add_argument("--calibration-window-days", type=int, default=None)
     alerts.add_argument("--shock-threshold", type=float, default=None)
     alerts.add_argument("--transition-entropy-threshold", type=float, default=None)
     alerts.add_argument("--coverage-threshold", type=float, default=None)
@@ -226,6 +233,7 @@ def _build_parser() -> argparse.ArgumentParser:
     forecast.add_argument("--horizon", type=int, default=10)
     forecast.add_argument("--interval", type=float, default=0.95)
     forecast.add_argument("--include-stationary", action="store_true")
+    forecast.add_argument("--include-quantiles", action="store_true")
 
     return parser
 
@@ -339,6 +347,7 @@ def main() -> None:
                     use_pinned=bool(args.use_pinned),
                     use_active=bool(args.use_active),
                     use_latest=bool(args.use_latest),
+                    calibration_window_days=args.calibration_window_days,
                     rules=rules,
                     base_url=base_url,
                 ),
@@ -355,6 +364,7 @@ def main() -> None:
                     horizon=int(args.horizon),
                     interval=float(args.interval),
                     include_stationary=bool(args.include_stationary),
+                    include_quantiles=bool(args.include_quantiles),
                     base_url=base_url,
                 ),
                 indent=2,

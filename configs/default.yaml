@@ -21,3 +21,4 @@ model:
 forecast:
   default_horizon: 10
   interval: 0.95
+  include_quantiles: false

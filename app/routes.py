@@ -44,6 +44,10 @@ _JSON_CACHE_FILENAMES = {
     "model_params.json",
     "events.json",
     "plot_meta.json",
+    "forecast_eval.json",
+    "baselines.json",
+    "backtest.json",
+    "data_meta.json",
 }
 _JSON_READ_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
 _MODEL_PARAMS_CACHE: dict[str, tuple[int, dict[str, np.ndarray]]] = {}
@@ -136,6 +140,7 @@ class AlertsEvaluateRequest(BaseModel):
     use_pinned: bool = Field(default=False)
     use_active: bool = Field(default=False)
     use_latest: bool = Field(default=False)
+    calibration_window_days: int | None = Field(default=None, ge=1, le=3650)
     rules: dict[str, Any] | None = Field(default=None)
 
 
@@ -595,6 +600,22 @@ def latest_run_report_markdown() -> Response:
     return _report_markdown_response(run_id=run_id, run_path=run_path)
 
 
+@router.get("/runs/latest/report.html")
+def latest_run_report_html() -> Response:
+    """Return HTML report for latest run."""
+    run_id = _latest_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return _report_html_response(run_id=run_id, run_path=run_path)
+
+
+@router.get("/runs/latest/backtest")
+def latest_run_backtest() -> dict[str, Any]:
+    """Return backtest artifact for latest run."""
+    run_id = _latest_run_id_or_404()
+    run_path = _resolve_run_path(run_id)
+    return _read_json(run_path / "backtest.json", run_id=run_id)
+
+
 
 @router.get("/runs/{run_id}/summary")
 def run_summary(run_id: str) -> dict[str, Any]:
@@ -662,6 +683,20 @@ def run_report_markdown(run_id: str) -> Response:
     """Return markdown report for a specific run."""
     run_path = _resolve_run_path(run_id)
     return _report_markdown_response(run_id=run_id, run_path=run_path)
+
+
+@router.get("/runs/{run_id}/report.html")
+def run_report_html(run_id: str) -> Response:
+    """Return HTML report for a specific run."""
+    run_path = _resolve_run_path(run_id)
+    return _report_html_response(run_id=run_id, run_path=run_path)
+
+
+@router.get("/runs/{run_id}/backtest")
+def run_backtest(run_id: str) -> dict[str, Any]:
+    """Return backtest artifact for a specific run id."""
+    run_path = _resolve_run_path(run_id)
+    return _read_json(run_path / "backtest.json", run_id=run_id)
 
 
 @router.get("/runs/{run_id}/artifacts")
@@ -1226,6 +1261,15 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
         "transition_prob_threshold": 0.35,
     }
     rules = {**defaults, **(request.rules or {})}
+    calibration_payload: dict[str, Any] | None = None
+    if request.calibration_window_days is not None:
+        calibration_payload = _calibrate_alert_thresholds(
+            run_id=run_id,
+            run_path=run_path,
+            coverage_horizon=int(rules.get("coverage_horizon", 1)),
+            calibration_window_days=int(request.calibration_window_days),
+            current_rules=rules,
+        )
 
     alerts: list[dict[str, Any]] = []
 
@@ -1239,9 +1283,12 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
         alerts.append(
             {
                 "id": "shock_occupancy_high",
-                "severity": "warning",
+                "severity": "medium",
                 "message": (
                     f"Shock occupancy {shock_occupancy:.4f} exceeds threshold {shock_threshold:.4f} for run {run_id}"
+                ),
+                "recommended_action": (
+                    "Review shock regime diagnostics and avoid promoting this run until occupancy normalizes."
                 ),
                 "evidence": {
                     "run_id": run_id,
@@ -1274,10 +1321,13 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
                 alerts.append(
                     {
                         "id": "transition_entropy_jump",
-                        "severity": "warning",
+                        "severity": "medium",
                         "message": (
                             f"Transition entropy jump {jump:.4f} exceeds threshold {entropy_threshold:.4f} "
                             f"(run {run_id} vs {baseline_run_id})"
+                        ),
+                        "recommended_action": (
+                            "Compare transition matrix drift against the pinned baseline before rollout."
                         ),
                         "evidence": {
                             "run_id": run_id,
@@ -1311,10 +1361,13 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
                 alerts.append(
                     {
                         "id": "forecast_coverage_low",
-                        "severity": "warning",
+                        "severity": "medium",
                         "message": (
                             f"Forecast coverage {coverage:.4f} is below threshold {coverage_threshold:.4f} "
                             f"at horizon {horizon} for run {run_id}"
+                        ),
+                        "recommended_action": (
+                            "Recalibrate forecast intervals or retrain with recent data before deployment."
                         ),
                         "evidence": {
                             "run_id": run_id,
@@ -1382,10 +1435,13 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
                         alerts.append(
                             {
                                 "id": "transition_probability_high",
-                                "severity": "warning",
+                                "severity": "high",
                                 "message": (
                                     f"One-step transition probability {to_prob:.4f} exceeds threshold "
                                     f"{float(transition_threshold):.4f} for run {run_id}"
+                                ),
+                                "recommended_action": (
+                                    "Prepare risk controls for an imminent regime switch and validate live hedging limits."
                                 ),
                                 "evidence": {
                                     "run_id": run_id,
@@ -1395,6 +1451,7 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
                         )
 
     triggered = bool(len(alerts) > 0)
+    severity = _aggregate_alert_severity(alerts)
     if triggered:
         recommended_action = (
             "Review run diagnostics and consider pinning a stable baseline run before promoting changes."
@@ -1405,6 +1462,8 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
         "run_id": run_id,
         "selection": selection,
         "baseline_run_id": baseline_run_id,
+        "calibration_window_days": request.calibration_window_days,
+        "threshold_recommendations": calibration_payload,
         "rules": rules,
         "threshold_used": {
             "shock_occupancy_threshold": _as_float_or_none(rules.get("shock_occupancy_threshold")),
@@ -1418,6 +1477,7 @@ def evaluate_alerts(request: AlertsEvaluateRequest) -> dict[str, Any]:
         "shock_prob": shock_prob,
         "transition_alert": transition_alert,
         "triggered": triggered,
+        "severity": severity,
         "recommended_action": recommended_action,
         "count": len(alerts),
         "alerts": alerts,
@@ -2088,6 +2148,7 @@ def forecast_v3(
     horizon: int = Query(default=10, ge=1, le=365),
     interval: float = Query(default=0.95, gt=0.0, lt=1.0),
     include_stationary: bool = Query(default=False),
+    include_quantiles: bool = Query(default=False),
 ) -> dict[str, Any]:
     """Return additive forecast schema with labeled and raw state moments."""
     resolved_run_id = _resolve_effective_run_id(run_id=run_id, use_pinned=use_pinned)
@@ -2110,9 +2171,14 @@ def forecast_v3(
     transition_matrix = np.asarray(model_params["transition_matrix"], dtype=np.float64)
     mu = np.asarray(model_params["mu"], dtype=np.float64)
     sigma = np.asarray(model_params["sigma"], dtype=np.float64)
+    robust_sigma = np.asarray(model_params.get("robust_sigma", sigma), dtype=np.float64)
+    if robust_sigma.shape != sigma.shape:
+        robust_sigma = sigma
     current = np.asarray(regime_probabilities[-1], dtype=np.float64)
     labels_map = _with_default_labels(_read_label_mapping(run_path), int(current.shape[0]))
     z_score = float(NormalDist().inv_cdf((1.0 + interval) / 2.0))
+    z05 = float(NormalDist().inv_cdf(0.05))
+    z95 = float(NormalDist().inv_cdf(0.95))
 
     rows: list[dict[str, Any]] = []
     for step in range(1, horizon + 1):
@@ -2136,6 +2202,15 @@ def forecast_v3(
                 "interval_high": float(expected_return + z_score * expected_vol),
             }
         )
+        if include_quantiles:
+            _, robust_vol = probability_weighted_moments(
+                state_probs=current,
+                mu=mu,
+                sigma=robust_sigma,
+            )
+            rows[-1]["p05"] = float(expected_return + z05 * robust_vol)
+            rows[-1]["p50"] = float(expected_return)
+            rows[-1]["p95"] = float(expected_return + z95 * robust_vol)
 
     return {
         "run_id": run_path.name,
@@ -2144,6 +2219,7 @@ def forecast_v3(
         "horizon": int(horizon),
         "interval": float(interval),
         "params_source": params_source,
+        "quantiles_enabled": bool(include_quantiles),
         "label_mapping": labels_map,
         "forecast": rows,
         "stationary": (
@@ -2583,10 +2659,33 @@ def _run_integrity_payload(run_id: str, run_path: Path, manifest: dict[str, Any]
 
     missing: list[str] = []
     mismatched: list[dict[str, str]] = []
+    warnings: list[str] = []
     for artifact_name in artifacts:
         name = str(artifact_name)
         path = run_path / name
         if name == "manifest.json":
+            continue
+        if name == "data_meta.json":
+            if not path.exists() or not path.is_file():
+                warnings.append(
+                    "data_meta.json missing; treating as legacy run (integrity check continues)."
+                )
+                continue
+            expected_hash = expected.get(name)
+            if expected_hash is None:
+                warnings.append(
+                    "data_meta.json hash missing in manifest; treating as legacy run metadata."
+                )
+                continue
+            actual_hash = _sha256_file(path)
+            if str(expected_hash) != actual_hash:
+                mismatched.append(
+                    {
+                        "name": name,
+                        "expected": str(expected_hash),
+                        "actual": actual_hash,
+                    }
+                )
             continue
         if not path.exists() or not path.is_file():
             missing.append(name)
@@ -2605,11 +2704,36 @@ def _run_integrity_payload(run_id: str, run_path: Path, manifest: dict[str, Any]
                 }
             )
 
+    data_hash = manifest.get("data_hash")
+    data_meta_path = run_path / "data_meta.json"
+    if not data_meta_path.exists():
+        if data_hash is not None:
+            warnings.append(
+                "manifest.data_hash present but data_meta.json missing; treating as legacy-compatible."
+            )
+        elif "data_meta.json" not in artifacts:
+            warnings.append(
+                "data_meta.json missing; legacy run without dataset metadata."
+            )
+    elif data_hash is not None:
+        data_meta = _read_json(data_meta_path, run_id=run_id)
+        actual_data_hash = str(data_meta.get("dataset_hash")) if isinstance(data_meta, dict) else None
+        expected_data_hash = str(data_hash)
+        if actual_data_hash != expected_data_hash:
+            mismatched.append(
+                {
+                    "name": "data_hash",
+                    "expected": expected_data_hash,
+                    "actual": str(actual_data_hash),
+                }
+            )
+
     return {
         "run_id": run_id,
         "ok": len(missing) == 0 and len(mismatched) == 0,
         "missing": missing,
         "mismatched": mismatched,
+        "warnings": warnings,
         "checked_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -2644,10 +2768,14 @@ def _build_run_info_payload(run_id: str, run_path: Path) -> dict[str, Any]:
 
 def _build_bundle_generated_artifacts(run_id: str, run_path: Path, request: Request) -> dict[str, bytes]:
     report_path = run_path / "report.md"
+    report_html_path = run_path / "report.html"
     report_md: str | None = None
+    report_html: str | None = None
     if report_path.exists():
         report_md = report_path.read_text(encoding="utf-8")
-    else:
+    if report_html_path.exists():
+        report_html = report_html_path.read_text(encoding="utf-8")
+    if report_md is None:
         try:
             report_md = _generate_report_markdown(
                 run_id=run_id,
@@ -2656,6 +2784,19 @@ def _build_bundle_generated_artifacts(run_id: str, run_path: Path, request: Requ
             )
         except HTTPException:
             report_md = None
+    if report_html is None:
+        try:
+            report_html = _generate_report_html(
+                run_id=run_id,
+                run_path=run_path,
+                allow_event_write=False,
+            )
+        except HTTPException:
+            report_html = (
+                _render_markdown_pre_html(report_md, run_id=run_id)
+                if report_md is not None
+                else None
+            )
 
     openapi_payload = request.app.openapi()
     run_info_payload = _build_run_info_payload(run_id=run_id, run_path=run_path)
@@ -2664,8 +2805,8 @@ def _build_bundle_generated_artifacts(run_id: str, run_path: Path, request: Requ
         "RUN_INFO.json": json.dumps(run_info_payload, indent=2).encode("utf-8"),
     }
     if report_md is not None:
-        report_html = _render_markdown_pre_html(report_md, run_id=run_id)
         output["report.md"] = report_md.encode("utf-8")
+    if report_html is not None:
         output["report.html"] = report_html.encode("utf-8")
     return output
 
@@ -3309,6 +3450,22 @@ def _report_markdown_response(run_id: str, run_path: Path) -> Response:
     return Response(content=report_content, media_type="text/markdown; charset=utf-8")
 
 
+def _report_html_response(run_id: str, run_path: Path) -> Response:
+    report_path = run_path / "report.html"
+    if report_path.exists():
+        return Response(content=report_path.read_text(encoding="utf-8"), media_type="text/html; charset=utf-8")
+
+    report_content = _generate_report_html(
+        run_id=run_id,
+        run_path=run_path,
+        allow_event_write=not _is_run_frozen(run_path),
+    )
+    if not _is_run_frozen(run_path):
+        report_path.write_text(report_content, encoding="utf-8")
+        _ensure_manifest_has_artifact(run_id=run_id, run_path=run_path, artifact_name="report.html")
+    return Response(content=report_content, media_type="text/html; charset=utf-8")
+
+
 def _generate_report_markdown(
     run_id: str,
     run_path: Path,
@@ -3349,6 +3506,19 @@ def _generate_report_markdown(
     shock_occ = diagnostics.get("shock_occupancy")
     last_regime = scorecard.get("last_regime", {})
     event_summary = evaluation.get("event_classifier_summary", {})
+    stability = evaluation.get("regime_stability", {})
+    baseline_comparison = evaluation.get("baseline_comparison", {})
+    baselines_payload = (
+        _read_json(run_path / "baselines.json", run_id=run_id)
+        if (run_path / "baselines.json").exists()
+        else {"summary": baseline_comparison}
+    )
+    transition_payload = (
+        _read_json(run_path / "transition_matrix.json", run_id=run_id)
+        if (run_path / "transition_matrix.json").exists()
+        else {}
+    )
+    transition_matrix = transition_payload.get("transition_matrix", [])
 
     lines: list[str] = [
         f"# Run Report: {run_id}",
@@ -3361,7 +3531,17 @@ def _generate_report_markdown(
         "## Regime Diagnostics",
         f"- transition_entropy: {transition_entropy}",
         f"- shock_occupancy: {shock_occ}",
+        f"- label_flip_rate_last_n_days: {stability.get('label_flip_rate_last_n_days')}",
+        f"- avg_segment_length_by_label: {stability.get('avg_segment_length_by_label', {})}",
         f"- last_regime: {last_regime.get('label')} ({last_regime.get('state')}) on {last_regime.get('date')}",
+        "",
+        "## Baselines",
+        f"- best_baseline_name: {baseline_comparison.get('best_baseline_name')}",
+        f"- delta_vs_hmm_test_avg_log_likelihood: {baseline_comparison.get('delta_vs_hmm_test_avg_log_likelihood')}",
+        f"- summary: {baselines_payload.get('summary', {})}",
+        "",
+        "## Transition Matrix Summary",
+        f"- shape: {np.asarray(transition_matrix, dtype=np.float64).shape if transition_matrix else 'n/a'}",
         "",
         "## Event Counts",
     ]
@@ -3386,9 +3566,206 @@ def _generate_report_markdown(
             "## Highlights",
             f"- event_counts_by_label: {event_summary.get('event_counts_by_label', {})}",
             f"- avg_event_duration_days_by_label: {event_summary.get('avg_event_duration_days_by_label', {})}",
+            "",
+            "## Alerts / Drift Examples",
+            f"- alerts_example: POST /alerts/evaluate {{\"run_id\": \"{run_id}\"}}",
+            f"- drift_example: POST /runs/drift {{\"run_a\": \"{run_id}\", \"run_b\": \"<other_run_id>\"}}",
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def _generate_report_html(
+    run_id: str,
+    run_path: Path,
+    allow_event_write: bool = True,
+) -> str:
+    evaluation = _read_json(run_path / "evaluation.json", run_id=run_id)
+    summary = (
+        _read_json(run_path / "regime_summary.json", run_id=run_id)
+        if (run_path / "regime_summary.json").exists()
+        else {}
+    )
+    transition_payload = (
+        _read_json(run_path / "transition_matrix.json", run_id=run_id)
+        if (run_path / "transition_matrix.json").exists()
+        else {}
+    )
+    baselines_payload = (
+        _read_json(run_path / "baselines.json", run_id=run_id)
+        if (run_path / "baselines.json").exists()
+        else {"summary": evaluation.get("baseline_comparison", {})}
+    )
+    try:
+        scorecard = _build_scorecard_payload(
+            run_id=run_id,
+            run_path=run_path,
+            allow_event_write=allow_event_write,
+        )
+    except HTTPException:
+        scorecard = {
+            "metrics": evaluation.get("metrics", {}),
+            "diagnostics": evaluation.get("regime_diagnostics", {}),
+            "events_by_label": {},
+            "last_regime": {},
+        }
+
+    events_payload = (
+        _read_json(run_path / "events.json", run_id=run_id)
+        if (run_path / "events.json").exists()
+        else {"events": []}
+    )
+    events = events_payload.get("events", [])
+    if not isinstance(events, list):
+        events = []
+
+    regimes = summary.get("regimes", evaluation.get("regime_diagnostics", {}).get("regimes", []))
+    if not isinstance(regimes, list):
+        regimes = []
+    occupancy_rows: list[tuple[str, float]] = []
+    for row in regimes:
+        if not isinstance(row, dict):
+            continue
+        label = str(row.get("label", f"regime_{row.get('regime', 'x')}"))
+        occ = _as_float_or_none(row.get("avg_posterior_probability", row.get("occupancy")))
+        if occ is not None:
+            occupancy_rows.append((label, float(occ)))
+
+    transition_matrix = np.asarray(transition_payload.get("transition_matrix", []), dtype=np.float64)
+    if transition_matrix.ndim != 2:
+        transition_matrix = np.asarray([], dtype=np.float64)
+    transition_labels = transition_payload.get("state_labels", [])
+    if not isinstance(transition_labels, list) or len(transition_labels) != int(
+        transition_matrix.shape[0] if transition_matrix.ndim == 2 else 0
+    ):
+        transition_labels = [f"state_{idx}" for idx in range(int(transition_matrix.shape[0] if transition_matrix.ndim == 2 else 0))]
+
+    occupancy_chart = "".join(
+        (
+            f"<div class='bar-row'><span>{html.escape(label)}</span>"
+            f"<div class='bar'><div style='width:{max(0.0, min(1.0, occ)) * 100:.1f}%'></div></div>"
+            f"<span>{occ:.3f}</span></div>"
+        )
+        for label, occ in occupancy_rows
+    ) or "<div class='muted'>No occupancy data available.</div>"
+
+    matrix_table = "<div class='muted'>No transition matrix artifact available.</div>"
+    if transition_matrix.ndim == 2 and transition_matrix.shape[0] > 0:
+        header = "".join(f"<th>{html.escape(str(label))}</th>" for label in transition_labels)
+        body_rows: list[str] = []
+        for i in range(transition_matrix.shape[0]):
+            row_cells = "".join(f"<td>{float(value):.3f}</td>" for value in transition_matrix[i])
+            body_rows.append(f"<tr><th>{html.escape(str(transition_labels[i]))}</th>{row_cells}</tr>")
+        matrix_table = (
+            "<table><thead><tr><th>from\\to</th>"
+            f"{header}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+        )
+
+    top_events = sorted(
+        [event for event in events if isinstance(event, dict)],
+        key=lambda event: float(event.get("duration_days", event.get("length", 0))),
+        reverse=True,
+    )[:10]
+    if top_events:
+        event_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(event.get('label')))}</td>"
+            f"<td>{html.escape(str(event.get('start_date')))}</td>"
+            f"<td>{html.escape(str(event.get('end_date')))}</td>"
+            f"<td>{html.escape(str(event.get('duration_days', event.get('length'))))}</td>"
+            f"<td>{float(_as_float_or_none(event.get('cumulative_log_return')) or 0.0):.4f}</td>"
+            "</tr>"
+            for event in top_events
+        )
+        events_table = (
+            "<table><thead><tr><th>Label</th><th>Start</th><th>End</th><th>Days</th><th>Cum Log Return</th>"
+            f"</tr></thead><tbody>{event_rows}</tbody></table>"
+        )
+    else:
+        events_table = "<div class='muted'>No events available.</div>"
+
+    baseline_rows = []
+    baselines = baselines_payload.get("baselines", {})
+    if isinstance(baselines, dict):
+        for name, payload in sorted(baselines.items()):
+            if not isinstance(payload, dict):
+                continue
+            val_avg = _as_float_or_none(payload.get("val", {}).get("avg_log_likelihood"))
+            test_avg = _as_float_or_none(payload.get("test", {}).get("avg_log_likelihood"))
+            baseline_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(name))}</td>"
+                f"<td>{'' if val_avg is None else f'{val_avg:.6f}'}</td>"
+                f"<td>{'' if test_avg is None else f'{test_avg:.6f}'}</td>"
+                "</tr>"
+            )
+    baselines_table = (
+        "<table><thead><tr><th>Baseline</th><th>Val Avg LL</th><th>Test Avg LL</th></tr></thead>"
+        f"<tbody>{''.join(baseline_rows)}</tbody></table>"
+        if baseline_rows
+        else "<div class='muted'>No baselines artifact available.</div>"
+    )
+
+    metrics = scorecard.get("metrics", {})
+    diagnostics = scorecard.get("diagnostics", {})
+    last_regime = scorecard.get("last_regime", {})
+    baseline_summary = evaluation.get("baseline_comparison", baselines_payload.get("summary", {}))
+    alerts_example = {
+        "run_id": run_id,
+        "triggered": bool((diagnostics.get("shock_occupancy") or 0.0) > 0.25),
+        "severity": "medium" if bool((diagnostics.get("shock_occupancy") or 0.0) > 0.25) else "low",
+    }
+    drift_example = {
+        "run_a": run_id,
+        "run_b": "<other_run_id>",
+        "metrics": ["delta_best_val_ll", "delta_transition_entropy", "delta_shock_occupancy"],
+    }
+
+    return (
+        "<!doctype html><html lang='en'><head><meta charset='utf-8' />"
+        f"<title>Run Report: {html.escape(run_id)}</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1' />"
+        "<style>"
+        "body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;margin:16px;background:#f7f8fb;color:#111;}"
+        ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;}"
+        ".card{background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;}"
+        "h1,h2{margin:0 0 8px 0;} h2{font-size:16px;}"
+        "table{width:100%;border-collapse:collapse;font-size:13px;}"
+        "th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;}"
+        ".muted{color:#666;font-size:13px;}"
+        ".bar-row{display:grid;grid-template-columns:120px 1fr 56px;gap:8px;align-items:center;margin-bottom:6px;font-size:13px;}"
+        ".bar{height:10px;background:#eee;border-radius:999px;overflow:hidden;}"
+        ".bar>div{height:10px;background:#2b6cb0;}"
+        "pre{margin:0;white-space:pre-wrap;background:#0f172a;color:#e2e8f0;padding:10px;border-radius:6px;font-size:12px;}"
+        "</style></head><body>"
+        f"<h1>Run Report: {html.escape(run_id)}</h1>"
+        "<div class='grid'>"
+        "<section class='card'><h2>Scorecard</h2>"
+        f"<div>best_val_log_likelihood: {html.escape(str(metrics.get('best_val_log_likelihood')))}</div>"
+        f"<div>epochs_ran: {html.escape(str(metrics.get('epochs_ran')))}</div>"
+        f"<div>stopped_early: {html.escape(str(metrics.get('stopped_early')))}</div>"
+        f"<div>transition_entropy: {html.escape(str(diagnostics.get('transition_entropy')))}</div>"
+        f"<div>shock_occupancy: {html.escape(str(diagnostics.get('shock_occupancy')))}</div>"
+        f"<div>last_regime: {html.escape(str(last_regime.get('label')))} ({html.escape(str(last_regime.get('state')))}) "
+        f"on {html.escape(str(last_regime.get('date')))}</div>"
+        "</section>"
+        "<section class='card'><h2>Baselines Comparison</h2>"
+        f"<div class='muted'>best={html.escape(str(baseline_summary.get('best_baseline_name')))} | "
+        f"delta_vs_hmm_test={html.escape(str(baseline_summary.get('delta_vs_hmm_test_avg_log_likelihood')))}</div>"
+        f"{baselines_table}</section>"
+        "<section class='card'><h2>Occupancy Chart</h2>"
+        f"{occupancy_chart}</section>"
+        "<section class='card'><h2>Transition Matrix</h2>"
+        f"{matrix_table}</section>"
+        "</div>"
+        "<section class='card' style='margin-top:12px;'><h2>Events</h2>"
+        f"{events_table}</section>"
+        "<section class='card' style='margin-top:12px;'><h2>Alerts Example</h2>"
+        f"<pre>{html.escape(json.dumps(alerts_example, indent=2))}</pre></section>"
+        "<section class='card' style='margin-top:12px;'><h2>Drift Example</h2>"
+        f"<pre>{html.escape(json.dumps(drift_example, indent=2))}</pre></section>"
+        "</body></html>"
+    )
 
 
 def _events_as_of_date(events: list[dict[str, Any]]) -> datetime:
@@ -3456,3 +3833,176 @@ def _shock_occupancy(summary: dict[str, Any]) -> float | None:
         if str(row.get("label")) == "shock":
             return _as_float_or_none(row.get("avg_posterior_probability"))
     return None
+
+
+def _aggregate_alert_severity(alerts: list[dict[str, Any]]) -> str:
+    order = {"low": 0, "medium": 1, "high": 2}
+    best = 0
+    for alert in alerts:
+        severity = str(alert.get("severity", "low"))
+        best = max(best, order.get(severity, 0))
+    reverse = {value: key for key, value in order.items()}
+    return reverse.get(best, "low")
+
+
+def _safe_parse_yyyy_mm_dd(value: Any) -> datetime | None:
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_horizon_coverage(payload: dict[str, Any], horizon: int) -> float | None:
+    horizons = payload.get("horizons", [])
+    if not isinstance(horizons, list):
+        return None
+    for row in horizons:
+        if not isinstance(row, dict):
+            continue
+        if int(row.get("horizon", -1)) == int(horizon):
+            return _as_float_or_none(row.get("coverage"))
+    if horizons and isinstance(horizons[0], dict):
+        return _as_float_or_none(horizons[0].get("coverage"))
+    return None
+
+
+def _max_offdiag_transition_prob(matrix: np.ndarray) -> float | None:
+    mat = np.asarray(matrix, dtype=np.float64)
+    if mat.ndim != 2 or mat.shape[0] != mat.shape[1] or mat.shape[0] == 0:
+        return None
+    mat = mat.copy()
+    np.fill_diagonal(mat, -np.inf)
+    value = float(np.max(mat))
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def _quantile_or_none(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    arr = np.asarray(values, dtype=np.float64)
+    return float(np.quantile(arr, q))
+
+
+def _calibrate_alert_thresholds(
+    run_id: str,
+    run_path: Path,
+    *,
+    coverage_horizon: int,
+    calibration_window_days: int,
+    current_rules: dict[str, Any],
+) -> dict[str, Any]:
+    as_of_value = _latest_run_payload(run_id=run_id, run_path=run_path).get("end_date")
+    as_of = _safe_parse_yyyy_mm_dd(as_of_value) or datetime.now(timezone.utc)
+    window_days = max(1, int(calibration_window_days))
+    cutoff = as_of - timedelta(days=window_days)
+
+    dated_runs: list[tuple[str, datetime]] = []
+    for candidate in _list_run_ids(order="asc"):
+        candidate_path = RUNS_ROOT / candidate
+        if not candidate_path.exists():
+            continue
+        end_date = _latest_run_payload(run_id=candidate, run_path=candidate_path).get("end_date")
+        end_dt = _safe_parse_yyyy_mm_dd(end_date)
+        if end_dt is None:
+            continue
+        if cutoff <= end_dt <= as_of:
+            dated_runs.append((candidate, end_dt))
+
+    dated_runs = sorted(dated_runs, key=lambda item: (item[1], item[0]))
+    shock_values: list[float] = []
+    coverage_values: list[float] = []
+    transition_values: list[float] = []
+    entropy_series: list[tuple[str, float]] = []
+
+    for candidate, _ in dated_runs:
+        candidate_path = RUNS_ROOT / candidate
+        summary_path = candidate_path / "regime_summary.json"
+        if summary_path.exists():
+            try:
+                occ = _shock_occupancy(_read_json(summary_path, run_id=candidate))
+                if occ is not None:
+                    shock_values.append(float(occ))
+            except HTTPException:
+                pass
+
+        evaluation_path = candidate_path / "evaluation.json"
+        if evaluation_path.exists():
+            try:
+                evaluation = _read_json(evaluation_path, run_id=candidate)
+                entropy = _as_float_or_none(
+                    evaluation.get("regime_diagnostics", {}).get("transition_entropy")
+                )
+                if entropy is not None:
+                    entropy_series.append((candidate, float(entropy)))
+            except HTTPException:
+                pass
+
+        forecast_eval_path = candidate_path / "forecast_eval.json"
+        if forecast_eval_path.exists():
+            try:
+                coverage_payload = _read_json(forecast_eval_path, run_id=candidate)
+                coverage = _select_horizon_coverage(coverage_payload, horizon=coverage_horizon)
+                if coverage is not None:
+                    coverage_values.append(float(coverage))
+            except HTTPException:
+                pass
+
+        transition_path = candidate_path / "transition_matrix.json"
+        if transition_path.exists():
+            try:
+                transition_payload = _read_json(transition_path, run_id=candidate)
+                max_prob = _max_offdiag_transition_prob(
+                    np.asarray(transition_payload.get("transition_matrix", []), dtype=np.float64)
+                )
+                if max_prob is not None:
+                    transition_values.append(float(max_prob))
+            except HTTPException:
+                pass
+
+    entropy_jumps: list[float] = []
+    for idx in range(1, len(entropy_series)):
+        entropy_jumps.append(abs(float(entropy_series[idx][1]) - float(entropy_series[idx - 1][1])))
+
+    shock_q = _quantile_or_none(shock_values, 0.9)
+    entropy_q = _quantile_or_none(entropy_jumps, 0.9)
+    coverage_q = _quantile_or_none(coverage_values, 0.1)
+    transition_q = _quantile_or_none(transition_values, 0.9)
+    recommended = {
+        "shock_occupancy_threshold": (
+            shock_q
+            if shock_q is not None
+            else _as_float_or_none(current_rules.get("shock_occupancy_threshold"))
+        ),
+        "transition_entropy_jump_threshold": (
+            entropy_q
+            if entropy_q is not None
+            else _as_float_or_none(current_rules.get("transition_entropy_jump_threshold"))
+        ),
+        "coverage_threshold": (
+            coverage_q
+            if coverage_q is not None
+            else _as_float_or_none(current_rules.get("coverage_threshold"))
+        ),
+        "transition_prob_threshold": (
+            transition_q
+            if transition_q is not None
+            else _as_float_or_none(current_rules.get("transition_prob_threshold"))
+        ),
+    }
+
+    return {
+        "as_of_date": as_of.strftime("%Y-%m-%d"),
+        "window_start_date": cutoff.strftime("%Y-%m-%d"),
+        "calibration_window_days": int(window_days),
+        "n_runs": int(len(dated_runs)),
+        "coverage_horizon": int(coverage_horizon),
+        "recommended_thresholds": recommended,
+        "sample_counts": {
+            "shock_occupancy": int(len(shock_values)),
+            "transition_entropy_jump": int(len(entropy_jumps)),
+            "coverage": int(len(coverage_values)),
+            "transition_prob": int(len(transition_values)),
+        },
+    }
